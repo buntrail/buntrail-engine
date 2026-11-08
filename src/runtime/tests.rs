@@ -689,7 +689,7 @@ fn silent_remote_detachment_has_a_bounded_unconfirmed_result() {
 }
 
 #[test]
-fn old_local_terminal_layout_does_not_launch_a_missing_process() {
+fn terminal_layout_is_memory_only_and_restart_is_empty() {
     let root = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
     let make = || {
@@ -704,6 +704,33 @@ fn old_local_terminal_layout_does_not_launch_a_missing_process() {
         &engine,
         json!({"command":"terminal.start","root":root.path(),"shell":"/bin/sh"}),
     );
+    let before = value(
+        &engine,
+        json!({"command":"terminal.layout","root":root.path()}),
+    );
+    value(
+        &engine,
+        json!({"command":"workspace.snapshot","root":root.path(),"documents":[]}),
+    );
+    let after = value(
+        &engine,
+        json!({"command":"terminal.layout","root":root.path()}),
+    );
+    assert_eq!(before["tabs"], after["tabs"]);
+    assert!(
+        engine
+            .runtime
+            .services
+            .local_connection()
+            .unwrap()
+            .store
+            .load()
+            .unwrap()
+            .records[0]
+            .terminal_layout
+            .tabs
+            .is_empty()
+    );
     value(&engine, json!({"command":"workspace.shutdown"}));
     drop(engine);
     let engine = make();
@@ -711,15 +738,10 @@ fn old_local_terminal_layout_does_not_launch_a_missing_process() {
         &engine,
         json!({"command":"terminal.layout","root":root.path()}),
     );
-    assert_eq!(layout["tabs"].as_array().unwrap().len(), 1);
+    assert!(layout["tabs"].as_array().unwrap().is_empty());
     assert_eq!(
-        engine.call(json!({"command":"terminal.attach","id":started["id"],"sequence":0}))["error"]
-            ["code"],
-        "runtime_lost"
-    );
-    value(
-        &engine,
-        json!({"command":"terminal.layout.close","id":started["id"]}),
+        engine.call(json!({"command":"terminal.attach","id":started["id"],"sequence":0}))["ok"],
+        false
     );
 }
 
@@ -828,4 +850,54 @@ fn explorer_remove_is_nonrecursive_on_local_and_framed_routes() {
         assert_eq!(response["ok"], true, "{response}");
         assert!(!root.exists());
     }
+}
+
+#[test]
+fn disconnected_terminal_context_survives_verified_route_replacement() {
+    let (server, engine, path) = fixture();
+    let old = engine.runtime.route("fixture").unwrap();
+    let owner = old.lease().clone();
+    let target = old.target().clone();
+    let locator = engine.runtime.registry.lock().unwrap().remotes["fixture"]
+        .locator
+        .clone();
+    let root = path.parent().unwrap();
+    let started = value(
+        &engine,
+        json!({"command":"remote.call","id":"fixture","request":{"command":"terminal.start","root":root,"shell":"/bin/sh"}}),
+    );
+    value(&engine, json!({"command":"remote.detach","id":"fixture"}));
+    assert_eq!(engine.call(json!({"command":"remote.call","id":"fixture","request":{"command":"terminal.write","id":started["id"],"text":"unsafe"}}))["ok"], false);
+    drop(old);
+    let remote = Arc::new(
+        RemoteServices::connect(
+            server.connect(),
+            target,
+            owner,
+            server.dir.path().join("new-spools"),
+        )
+        .unwrap(),
+    );
+    remote.set_authentication(None).unwrap();
+    engine.runtime.registry.lock().unwrap().remotes.insert(
+        "replacement".into(),
+        Route {
+            services: remote,
+            _owner: None,
+            locator,
+        },
+    );
+    let layout = value(
+        &engine,
+        json!({"command":"remote.call","id":"replacement","request":{"command":"terminal.layout","root":root}}),
+    );
+    assert_eq!(layout["tabs"], started["layout"]["tabs"]);
+    value(
+        &engine,
+        json!({"command":"remote.call","id":"replacement","request":{"command":"terminal.attach","id":started["id"],"sequence":0}}),
+    );
+    value(
+        &engine,
+        json!({"command":"remote.call","id":"replacement","request":{"command":"terminal.close","id":started["id"]}}),
+    );
 }

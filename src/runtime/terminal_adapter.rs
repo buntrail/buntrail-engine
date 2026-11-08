@@ -6,11 +6,30 @@ use std::task::{Context as PollContext, Poll, Waker};
 pub(super) struct Terminals {
     workspaces: HashMap<String, Arc<Mutex<TerminalWorkspace>>>,
     sessions: HashMap<String, Arc<TerminalPane>>,
+    detached: HashMap<WorkspaceID, DetachedTerminalWorkspace>,
 }
 pub(super) struct TerminalWorkspace {
     pub(super) record: WorkspaceRecord,
     pub(super) owner: WorkspaceLease,
     service: Arc<dyn TerminalService>,
+}
+struct DetachedTerminalWorkspace {
+    target: TargetIdentity,
+    owner: WorkspaceLease,
+    layout: TerminalLayoutState,
+    starts: Vec<TerminalStart>,
+    generation: u64,
+    expires: std::time::Instant,
+}
+impl TerminalWorkspace {
+    fn advance_generation(&mut self) -> Result<()> {
+        self.record.generation = self
+            .record
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| fail("exhausted", "Workspace generation exhausted"))?;
+        Ok(())
+    }
 }
 struct TerminalPane {
     workspace: Arc<Mutex<TerminalWorkspace>>,
@@ -24,7 +43,7 @@ struct Output {
     drained: bool,
 }
 impl Terminals {
-    pub(super) fn detach(&mut self, route: &str) {
+    pub(super) fn detach(&mut self, route: &str, retain_for_reattach: bool) {
         let prefix = format!("{route}:");
         let workspaces = self
             .workspaces
@@ -32,6 +51,27 @@ impl Terminals {
             .filter(|(key, _)| key.starts_with(&prefix))
             .map(|(_, value)| value.clone())
             .collect::<Vec<_>>();
+        self.detached
+            .retain(|_, saved| saved.expires > std::time::Instant::now());
+        for workspace in &workspaces {
+            let w = workspace.lock().unwrap();
+            if retain_for_reattach && !w.record.terminal_layout.tabs.is_empty() {
+                self.detached.insert(
+                    w.record.id,
+                    DetachedTerminalWorkspace {
+                        target: w.record.target.clone(),
+                        owner: w.owner.clone(),
+                        layout: w.record.terminal_layout.clone(),
+                        starts: w.record.terminal_starts.clone(),
+                        generation: w.record.generation,
+                        expires: std::time::Instant::now()
+                            + std::time::Duration::from_secs(30 * 60),
+                    },
+                );
+            } else {
+                self.detached.remove(&w.record.id);
+            }
+        }
         self.sessions
             .retain(|_, pane| !workspaces.iter().any(|w| Arc::ptr_eq(w, &pane.workspace)));
         self.workspaces.retain(|key, _| !key.starts_with(&prefix));
@@ -95,78 +135,87 @@ impl Runtime {
             .services
             .local_connection()
             .map_err(|e| fail("unavailable", e))?;
-        let (record, owner, service): (_, _, Arc<dyn TerminalService>) = if let Some(route) = route
-        {
-            let remote = self.route(route)?;
-            let locator = self.registry.lock().unwrap().remotes[route].locator.clone();
-            let owner = remote.lease().clone();
-            let catalog = local.store.load().map_err(error)?;
-            let record = match catalog
-                .records
-                .into_iter()
-                .find(|w| w.id == owner.workspace)
-            {
-                Some(record)
-                    if record.target == *remote.target()
-                        && record.lease == owner.lease
-                        && record.locator.root == root =>
+        let (mut record, owner, service): (_, _, Arc<dyn TerminalService>) =
+            if let Some(route) = route {
+                let remote = self.route(route)?;
+                let locator = self.registry.lock().unwrap().remotes[route].locator.clone();
+                let owner = remote.lease().clone();
+                let catalog = local.store.load().map_err(error)?;
+                let record = match catalog
+                    .records
+                    .into_iter()
+                    .find(|w| w.id == owner.workspace)
                 {
-                    record
-                }
-                Some(_) => {
-                    return Err(fail(
-                        "wrong_workspace",
-                        "Remote owner already has a different workspace root",
-                    ));
-                }
-                None => local
+                    Some(record)
+                        if record.target == *remote.target()
+                            && record.lease == owner.lease
+                            && record.locator.root == root =>
+                    {
+                        record
+                    }
+                    Some(_) => {
+                        return Err(fail(
+                            "wrong_workspace",
+                            "Remote owner already has a different workspace root",
+                        ));
+                    }
+                    None => local
+                        .store
+                        .register_resolved(WorkspaceRecord {
+                            id: owner.workspace,
+                            generation: 0,
+                            lease: owner.lease,
+                            locator: WorkspaceLocator {
+                                environment: locator,
+                                root,
+                            },
+                            target: remote.target().clone(),
+                            display_name: string(r, "root")?.into(),
+                            documents: vec![],
+                            selected: None,
+                            show_hidden: true,
+                            show_icons: true,
+                            sidebar_visible: true,
+                            terminal_visible: true,
+                            terminal_height: None,
+                            terminal_layout: Default::default(),
+                            terminal_starts: vec![],
+                            graph_filters: vec![],
+                            git_recoveries: vec![],
+                            git_recovery_generation: 0,
+                        })
+                        .map_err(error)?,
+                };
+                (record, owner, remote)
+            } else {
+                let record = match local
                     .store
-                    .register_resolved(WorkspaceRecord {
-                        id: owner.workspace,
-                        generation: 0,
-                        lease: owner.lease,
-                        locator: WorkspaceLocator {
-                            environment: locator,
-                            root,
-                        },
-                        target: remote.target().clone(),
-                        display_name: string(r, "root")?.into(),
-                        documents: vec![],
-                        selected: None,
-                        show_hidden: true,
-                        show_icons: true,
-                        sidebar_visible: true,
-                        terminal_visible: true,
-                        terminal_height: None,
-                        terminal_layout: Default::default(),
-                        terminal_starts: vec![],
-                        graph_filters: vec![],
-                        git_recoveries: vec![],
-                        git_recovery_generation: 0,
-                    })
-                    .map_err(error)?,
+                    .open(root, local.identity.clone())
+                    .map_err(error)?
+                {
+                    WorkspaceState::Ready(record) => record,
+                    WorkspaceState::Missing(_) => {
+                        return Err(fail("not_found", "Workspace directory unavailable"));
+                    }
+                };
+                local.register(record.id, record.lease).map_err(error)?;
+                let owner = WorkspaceLease {
+                    client: local.client,
+                    workspace: record.id,
+                    lease: record.lease,
+                    runtime: local.runtime.clone(),
+                };
+                (record, owner, local.terminal.clone())
             };
-            (record, owner, remote)
-        } else {
-            let record = match local
-                .store
-                .open(root, local.identity.clone())
-                .map_err(error)?
-            {
-                WorkspaceState::Ready(record) => record,
-                WorkspaceState::Missing(_) => {
-                    return Err(fail("not_found", "Workspace directory unavailable"));
-                }
-            };
-            local.register(record.id, record.lease).map_err(error)?;
-            let owner = WorkspaceLease {
-                client: local.client,
-                workspace: record.id,
-                lease: record.lease,
-                runtime: local.runtime.clone(),
-            };
-            (record, owner, local.terminal.clone())
-        };
+        if let Some(saved) = terminals.detached.remove(&record.id)
+            && saved.expires > std::time::Instant::now()
+            && saved.target == record.target
+            && saved.owner == owner
+        {
+            record.terminal_layout = saved.layout;
+            record.terminal_starts = saved.starts;
+            record.generation = record.generation.max(saved.generation);
+        }
         let workspace = Arc::new(Mutex::new(TerminalWorkspace {
             record,
             owner,
@@ -187,11 +236,7 @@ impl Runtime {
         Ok(workspace)
     }
     pub(super) fn persist_workspace(&self, workspace: &mut TerminalWorkspace) -> Result<()> {
-        workspace.record.generation = workspace
-            .record
-            .generation
-            .checked_add(1)
-            .ok_or_else(|| fail("exhausted", "Workspace generation exhausted"))?;
+        workspace.advance_generation()?;
         self.services
             .local_connection()
             .map_err(|e| fail("unavailable", e))?
@@ -259,7 +304,7 @@ impl Runtime {
                     directory,
                     shell,
                 });
-                self.persist_workspace(&mut w)?;
+                w.advance_generation()?;
                 (w.service.clone(), request)
             };
             let pane = Arc::new(TerminalPane {
@@ -434,7 +479,7 @@ impl Runtime {
                     .terminal_layout
                     .focus(pane.session)
                     .map_err(error)?;
-                self.persist_workspace(&mut w)?;
+                w.advance_generation()?;
                 Ok(layout_value(&w))
             }
             "terminal.layout.resize" => {
@@ -450,7 +495,7 @@ impl Runtime {
                     .terminal_layout
                     .resize_at(tab, number(r, "path")?, depth, ratio)
                     .map_err(error)?;
-                self.persist_workspace(&mut w)?;
+                w.advance_generation()?;
                 Ok(layout_value(&w))
             }
             "terminal.close" | "terminal.layout.close" => {
@@ -467,7 +512,7 @@ impl Runtime {
                 w.record
                     .terminal_starts
                     .retain(|s| s.session != pane.session);
-                self.persist_workspace(&mut w)?;
+                w.advance_generation()?;
                 let layout = layout_value(&w);
                 drop(w);
                 self.terminals
@@ -478,6 +523,58 @@ impl Runtime {
                 Ok(layout)
             }
             _ => Err(fail("invalid_request", "Unknown terminal operation")),
+        }
+    }
+}
+
+#[cfg(test)]
+mod detached_tests {
+    use super::*;
+    #[test]
+    fn detached_context_rejects_changed_identity_and_expiry() {
+        for change in 0..6 {
+            let state = tempfile::tempdir().unwrap();
+            let root = tempfile::tempdir().unwrap();
+            let services = Arc::new(Services::with_state_directory(state.path().to_owned()));
+            let mut engine = crate::Engine::new();
+            engine.services = services.clone();
+            engine.runtime = Arc::new(Runtime::new(services, engine.documents.clone()));
+            let started = engine
+                .call(json!({"command":"terminal.start","root":root.path(),"shell":"/bin/sh"}));
+            assert_eq!(started["ok"], true, "{started}");
+            {
+                let mut terminals = engine.runtime.terminals.lock().unwrap();
+                terminals.detach("local", true);
+                let saved = terminals.detached.values_mut().next().unwrap();
+                match change {
+                    0 => saved.target.security_binding.push(1),
+                    1 => saved.owner.client = ClientID([1; 16]),
+                    2 => saved.owner.workspace = WorkspaceID([2; 16]),
+                    3 => saved.owner.lease = WorkspaceLeaseID([3; 16]),
+                    4 => saved.owner.runtime.supervisor_boot = [4; 16],
+                    _ => {
+                        saved.expires =
+                            std::time::Instant::now() - std::time::Duration::from_secs(1)
+                    }
+                }
+            }
+            let layout = engine.call(json!({"command":"terminal.layout","root":root.path()}));
+            assert_eq!(layout["ok"], true);
+            assert!(
+                layout["value"]["tabs"].as_array().unwrap().is_empty(),
+                "accepted foreign/expired context {change}"
+            );
+            let attach = engine.call(
+                json!({"command":"terminal.attach","id":started["value"]["id"],"sequence":0}),
+            );
+            assert_eq!(
+                attach["ok"], false,
+                "attached foreign/expired context {change}"
+            );
+            assert_eq!(
+                engine.call(json!({"command":"workspace.shutdown"}))["ok"],
+                true
+            );
         }
     }
 }
