@@ -901,3 +901,91 @@ fn disconnected_terminal_context_survives_verified_route_replacement() {
         json!({"command":"remote.call","id":"replacement","request":{"command":"terminal.close","id":started["id"]}}),
     );
 }
+
+#[test]
+fn repository_browsing_and_prepared_actions_cross_framed_routes() {
+    let (_server, engine, base) = fixture();
+    let root = base.parent().unwrap().join("repository-new");
+    std::fs::create_dir(&root).unwrap();
+    for args in [
+        vec!["init", "-b", "main"],
+        vec!["config", "user.name", "Fixture"],
+        vec!["config", "user.email", "fixture@example.invalid"],
+        vec!["config", "commit.gpgsign", "false"],
+        vec!["config", "core.hooksPath", ".git/hooks"],
+    ] {
+        assert!(
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    std::fs::write(root.join("file"), b"one\r\n").unwrap();
+    for args in [
+        vec!["add", "file"],
+        vec!["commit", "-m", "repository fixture"],
+    ] {
+        assert!(
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    for remote in [false, true] {
+        let call = |request: Value| {
+            value(
+                &engine,
+                if remote {
+                    json!({"command":"remote.call","id":"fixture","request":request})
+                } else {
+                    request
+                },
+            )
+        };
+        let snapshot = call(json!({"command":"git.repository","root":root}));
+        let head = &snapshot["state"]["head"]["Branch"];
+        let oid = head["oid"].as_str().unwrap();
+        let name = if remote {
+            "remote-topic"
+        } else {
+            "local-topic"
+        };
+        let expected = json!({"Git":{"state":snapshot["state"],"worktree":snapshot["worktree"]}});
+        let create = call(
+            json!({"command":"git.mutate","root":root,"expected":expected,"action":{"CreateBranch":{"name":name.as_bytes(),"source_ref":head["name"],"start_oid":oid}}}),
+        );
+        assert_eq!(create["status"], 0, "{create}");
+        assert_eq!(
+            call(json!({"command":"git.inspect","operation":create["operation"]}))["resolved"],
+            true
+        );
+        let history = call(
+            json!({"command":"git.history","root":root,"filter":{"authored_since":null,"text":"REPOSITORY FIXTURE"}}),
+        );
+        assert_eq!(history["commits"].as_array().unwrap().len(), 1);
+        let detail = call(json!({"command":"git.commit","root":root,"oid":oid}));
+        let path = &detail["files"][0]["path"];
+        let diff = call(json!({"command":"git.commit_diff","root":root,"oid":oid,"path":path}));
+        assert_eq!(diff["content"], "Text");
+        let switch = call(
+            json!({"command":"git.mutate","root":root,"expected":expected,"action":{"SwitchBranch":{"name":name.as_bytes(),"expected_oid":oid}}}),
+        );
+        assert_eq!(switch["status"], 0, "{switch}");
+        assert_eq!(
+            call(json!({"command":"git.inspect","operation":switch["operation"]}))["resolved"],
+            true
+        );
+        let updated = call(json!({"command":"git.repository","root":root}));
+        assert_eq!(
+            updated["state"]["head"]["Branch"]["name"],
+            json!(format!("refs/heads/{name}").as_bytes())
+        );
+        assert_eq!(std::fs::read(root.join("file")).unwrap(), b"one\r\n");
+    }
+}

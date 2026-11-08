@@ -1,6 +1,6 @@
 [package]
 name = "buntrail-engine"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.99.1"
 description = "Authoritative document and workspace orchestration."
@@ -15,15 +15,15 @@ authors = ["Bunga Mungil <bungamungil@icloud.com>"]
 test-support = ["buntrail-services/test-support"]
 
 [dependencies]
-buntrail-protocol = "0.1.0"
+buntrail-protocol = "0.2.0"
 base64 = "=0.22.1"
 sha2 = "=0.10.9"
 futures-core = "=0.3.31"
-buntrail-core = "0.1.0"
-buntrail-language = "0.1.0"
+buntrail-core = "0.2.0"
+buntrail-language = "0.2.0"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.154"
-buntrail-services = "0.1.1"
+buntrail-services = "0.2.0"
 
 [dev-dependencies]
 libc = "=0.2.191"

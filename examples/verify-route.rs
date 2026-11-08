@@ -296,6 +296,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         let history = run(remote.history(HistoryQuery {
+            filter: None,
             worktree: worktree.clone(),
             ref_filter: vec![],
             cursor: None,

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.0 — Git Repository
+
+Expose repository APIs and coordinate document admission, frozen repository identity, operation retention and local/framed mutation outcomes.
+
 ## 0.1.1
 
 Keep terminal restoration state in memory, preserve catalog documents and verified ownership, and retain safe same-run remote reconnect context.

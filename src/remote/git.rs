@@ -1,5 +1,56 @@
 use super::*;
+impl RemoteServices {
+    pub(crate) fn require_repository(&self) -> Result<(), CoreError> {
+        if !self
+            .negotiated_capabilities()
+            .iter()
+            .any(|v| v == "git.repository.v1")
+        {
+            return Err(CoreError::new(
+                ErrorCode::Unavailable,
+                "Active helper lacks repository support; preserve retained sessions and update after they end",
+            ));
+        }
+        Ok(())
+    }
+}
 impl GitService for RemoteServices {
+    fn repository(
+        &self,
+        worktree: WorktreeIdentity,
+    ) -> ServiceFuture<'_, Result<GitRepositorySnapshot, CoreError>> {
+        Box::pin(async move {
+            self.check(&worktree.target)?;
+            self.require_repository()?;
+            match self.call(
+                w::Call::Repository {
+                    worktree: w::Worktree::from_core(&worktree)?,
+                },
+                None,
+            )? {
+                w::Reply::Repository { snapshot } if snapshot.worktree == worktree => Ok(*snapshot),
+                _ => Err(w::invalid()),
+            }
+        })
+    }
+    fn commit(&self, query: CommitQuery) -> ServiceFuture<'_, Result<CommitPage, CoreError>> {
+        Box::pin(async move {
+            self.check(&query.worktree.target)?;
+            self.require_repository()?;
+            match self.call(
+                w::Call::Commit {
+                    worktree: w::Worktree::from_core(&query.worktree)?,
+                    oid: query.oid.clone(),
+                    cursor: query.cursor,
+                },
+                None,
+            )? {
+                w::Reply::Commit { page } if page.oid == query.oid => Ok(page),
+                _ => Err(w::invalid()),
+            }
+        })
+    }
+
     fn read_query(
         &self,
         worktree: WorktreeIdentity,
@@ -43,6 +94,9 @@ impl GitService for RemoteServices {
         r: GitMutationRequest,
     ) -> ServiceFuture<'_, Result<Option<OperationReceipt>, CoreError>> {
         Box::pin(async move {
+            if matches!(r.command, GitMutation::Repository(_)) {
+                self.require_repository()?;
+            }
             if self
                 .negotiated_capabilities()
                 .iter()
@@ -140,6 +194,9 @@ impl GitService for RemoteServices {
     fn diff(&self, r: DiffRequest) -> ServiceFuture<'_, Result<DiffSnapshot, CoreError>> {
         Box::pin(async move {
             self.check(&r.worktree.target)?;
+            if matches!(r.source, DiffSource::Commit(_)) {
+                self.require_repository()?;
+            }
             match self.call(
                 w::Call::Diff {
                     worktree: w::Worktree::from_core(&r.worktree)?,
@@ -185,14 +242,22 @@ impl GitService for RemoteServices {
     fn history(&self, r: HistoryQuery) -> ServiceFuture<'_, Result<GraphPage, CoreError>> {
         Box::pin(async move {
             self.check(&r.worktree.target)?;
-            match self.call(
+            let call = if let Some(filter) = &r.filter {
+                self.require_repository()?;
+                w::Call::FilteredHistory {
+                    worktree: w::Worktree::from_core(&r.worktree)?,
+                    refs: r.ref_filter.iter().map(|v| B64.encode(v)).collect(),
+                    cursor: r.cursor.as_ref().map(|v| B64.encode(v)),
+                    filter: filter.clone(),
+                }
+            } else {
                 w::Call::History {
                     worktree: w::Worktree::from_core(&r.worktree)?,
-                    refs: r.ref_filter.iter().map(|r| B64.encode(r)).collect(),
-                    cursor: r.cursor.map(|c| B64.encode(c)),
-                },
-                None,
-            )? {
+                    refs: r.ref_filter.iter().map(|v| B64.encode(v)).collect(),
+                    cursor: r.cursor.as_ref().map(|v| B64.encode(v)),
+                }
+            };
+            match self.call(call, None)? {
                 w::Reply::History {
                     commits,
                     continuation_edges,
@@ -213,6 +278,19 @@ impl GitService for RemoteServices {
     }
     fn mutate(&self, r: GitMutationRequest) -> ServiceFuture<'_, OperationReceipt> {
         Box::pin(async move {
+            if matches!(r.command, GitMutation::Repository(_))
+                && let Err(error) = self.require_repository()
+            {
+                return OperationReceipt {
+                    id: r.operation,
+                    state: OperationState::Failed(OperationFailure {
+                        error,
+                        target: r.worktree.target.clone(),
+                        observed: ObservedState::Unobserved,
+                        effect: FailureEffect::ProvenNoEffect,
+                    }),
+                };
+            }
             let id = r.operation;
             let target = r.worktree.target.clone();
             let result = (|| -> Result<OperationReceipt, CoreError> {
