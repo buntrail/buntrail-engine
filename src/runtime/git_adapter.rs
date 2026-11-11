@@ -596,8 +596,12 @@ fn mutation(
         .map_err(error)
     };
     Ok(match args {
-        ["add", "--", file] => GitMutation::Stage(vec![path(file)?]),
-        ["reset", "HEAD", "--", file] => GitMutation::Unstage(vec![path(file)?]),
+        ["add", "--", paths @ ..] if !paths.is_empty() => {
+            GitMutation::Stage(paths.iter().map(|p| path(p)).collect::<Result<Vec<_>>>()?)
+        }
+        ["reset", "HEAD", "--", paths @ ..] if !paths.is_empty() => {
+            GitMutation::Unstage(paths.iter().map(|p| path(p)).collect::<Result<Vec<_>>>()?)
+        }
         ["commit", "-m", message] if !message.trim().is_empty() && message.len() <= 1024 * 1024 => {
             GitMutation::Commit {
                 message: (*message).into(),

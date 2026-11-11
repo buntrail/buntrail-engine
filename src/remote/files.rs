@@ -505,10 +505,20 @@ impl FileService for RemoteServices {
                         confirmed_path: file.path_base64.clone(),
                     },
                     FileMutation::Trash => {
-                        return Err(CoreError::new(
-                            ErrorCode::Unavailable,
-                            "Remote deletion is permanent on the displayed target; local Trash is unavailable",
-                        ));
+                        if !self
+                            .negotiated_capabilities()
+                            .iter()
+                            .any(|c| c == "file.trash")
+                        {
+                            return Err(CoreError::new(
+                                ErrorCode::Unavailable,
+                                "Active helper lacks Trash; update after retained sessions end",
+                            ));
+                        }
+                        w::FileCommand::Trash {
+                            confirmed_target: self.transport.context.target_binding.clone(),
+                            confirmed_path: file.path_base64.clone(),
+                        }
                     }
                     FileMutation::Create { .. } => unreachable!(),
                 };

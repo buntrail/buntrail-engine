@@ -183,6 +183,7 @@ impl Runtime {
                             graph_filters: vec![],
                             git_recoveries: vec![],
                             git_recovery_generation: 0,
+                            file_recoveries: vec![],
                         })
                         .map_err(error)?,
                 };

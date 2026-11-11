@@ -1056,3 +1056,248 @@ fn terminal_start_remote_directory_retains_authority_and_shell_cwd() {
         json!({"command":"remote.call","id":"fixture","request":{"command":"terminal.close","id":created["id"]}}),
     );
 }
+
+#[test]
+fn explorer_import_preserves_bytes_and_refuses_collisions() {
+    let dir = tempfile::tempdir().unwrap();
+    let services = Arc::new(Services::with_state_directory(dir.path().join("state")));
+    let mut engine = Engine::new();
+    engine.services = services.clone();
+    engine.runtime = Arc::new(Runtime::new(services, engine.documents.clone()));
+    let source = dir.path().join("source");
+    let destination = dir.path().join("copy");
+    let bytes = b"\xff\xfea\0\r\0\n\0\0\0";
+    std::fs::write(&source, bytes).unwrap();
+    let observed = value(&engine, json!({"command":"fs.observe","path":source}));
+    let request = json!({"command":"fs.import","root":dir.path(),"source_path":source,"source_observed":observed["observed"],"path":destination,"operation":OperationID([91;16])});
+    let imported = value(&engine, request.clone());
+    assert!(imported.get("receipt").is_some());
+    assert_eq!(std::fs::read(&destination).unwrap(), bytes);
+    value(
+        &engine,
+        json!({"command":"fs.inspect_operation","operation":OperationID([91;16])}),
+    );
+    let mut collision = request.clone();
+    collision["operation"] = json!(OperationID([92; 16]));
+    let collision = value(&engine, collision);
+    assert!(collision["receipt"]["state"].get("Failed").is_some());
+    assert_eq!(std::fs::read(&destination).unwrap(), bytes);
+    assert_eq!(std::fs::read(&source).unwrap(), bytes);
+    assert_eq!(
+        value(&engine, json!({"command":"fs.pending"}))["entries"],
+        json!([])
+    );
+}
+
+#[test]
+fn explorer_git_multi_path_is_literal_and_unstages_unborn_index() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(dir.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let state = tempfile::tempdir().unwrap();
+    let services = Arc::new(Services::with_state_directory(state.path().to_owned()));
+    let mut engine = Engine::new();
+    engine.services = services.clone();
+    engine.runtime = Arc::new(Runtime::new(services, engine.documents.clone()));
+    for name in ["a[1]", "a1", "b"] {
+        std::fs::write(dir.path().join(name), name).unwrap();
+    }
+    let stage = value(
+        &engine,
+        json!({"command":"git","root":dir.path(),"args":["add","--","a[1]","b"]}),
+    );
+    assert_eq!(stage["status"], 0, "{stage}");
+    let staged = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir.path())
+        .args(["diff", "--cached", "--name-only", "-z"])
+        .output()
+        .unwrap();
+    assert_eq!(staged.stdout, b"a[1]\0b\0");
+    value(
+        &engine,
+        json!({"command":"git.inspect","operation":stage["operation"]}),
+    );
+    let unstage = value(
+        &engine,
+        json!({"command":"git","root":dir.path(),"args":["reset","HEAD","--","a[1]","b"]}),
+    );
+    assert_eq!(unstage["status"], 0, "{unstage}");
+    assert_eq!(std::fs::read(dir.path().join("a[1]")).unwrap(), b"a[1]");
+}
+
+#[test]
+fn explorer_import_remote_keeps_source_and_never_falls_back_to_local() {
+    let (server, engine, path) = fixture();
+    let source = server.dir.path().join("source-binary");
+    let bytes = vec![0xff; 9 * 1024 * 1024];
+    std::fs::write(&source, &bytes).unwrap();
+    let observed = value(&engine, json!({"command":"fs.observe","path":source}));
+    let request = json!({"command":"fs.import","root":server.dir.path(),"source_path":source,"source_observed":observed["observed"],"path":path,"remote":"fixture","operation":OperationID([93;16])});
+    let reply = value(&engine, request.clone());
+    assert!(
+        reply["receipt"]["state"].get("Confirmed").is_some(),
+        "{reply}"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    assert_eq!(std::fs::read(&source).unwrap(), bytes);
+    engine
+        .runtime
+        .registry
+        .lock()
+        .unwrap()
+        .remotes
+        .remove("fixture");
+    let rejected = server.dir.path().join("must-not-exist");
+    let mut request = request;
+    request["path"] = json!(rejected);
+    request["operation"] = json!(OperationID([94; 16]));
+    assert_eq!(engine.call(request)["ok"], false);
+    assert!(!rejected.exists());
+}
+
+#[test]
+fn explorer_operations_retain_unknown_inspect_original_and_never_replay() {
+    use buntrail_core::workspaces::{FileRecoveryKind, FileRecoveryReference};
+    let dir = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let services = Arc::new(Services::with_state_directory(state.path().to_owned()));
+    let mut engine = Engine::new();
+    engine.services = services.clone();
+    engine.runtime = Arc::new(Runtime::new(services, engine.documents.clone()));
+    let path = dir.path().join("kept");
+    std::fs::write(&path, b"kept").unwrap();
+    let observed = value(&engine, json!({"command":"fs.observe","path":path}));
+    let binding = Services::file_binding(observed["observed"].as_str().unwrap()).unwrap();
+    let workspace = engine
+        .runtime
+        .terminal_workspace(None, &json!({"root":dir.path()}))
+        .unwrap();
+    let owner = workspace.lock().unwrap().owner.clone();
+    let local = engine.runtime.services.local_connection().unwrap();
+    let operation = OperationID([95; 16]);
+    local
+        .store
+        .retain_file_recovery(
+            owner.workspace,
+            FileRecoveryReference {
+                operation,
+                file: binding.file.clone(),
+                destination: None,
+                kind: FileRecoveryKind::Remove,
+                request_digest: [1; 32],
+                owner,
+            },
+        )
+        .unwrap();
+    let request = json!({"command":"fs.remove","root":dir.path(),"path":path,"observed":observed["observed"],"operation":operation});
+    assert_eq!(engine.call(request)["ok"], false);
+    assert_eq!(std::fs::read(&path).unwrap(), b"kept");
+    let unknown = value(
+        &engine,
+        json!({"command":"fs.inspect_operation","operation":operation}),
+    );
+    assert_eq!(unknown["resolved"], false);
+    assert_eq!(
+        value(&engine, json!({"command":"fs.pending"}))["entries"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let receipt = run(local.files.mutate(FileMutationRequest {
+        operation,
+        file: binding.file,
+        expected: ExpectedPathState::Present(binding.version),
+        command: FileMutation::Remove,
+    }));
+    assert!(matches!(receipt.state, OperationState::Confirmed(_)));
+    assert_eq!(
+        value(
+            &engine,
+            json!({"command":"fs.inspect_operation","operation":operation})
+        )["resolved"],
+        true
+    );
+    assert_eq!(
+        value(&engine, json!({"command":"fs.pending"}))["entries"],
+        json!([])
+    );
+}
+
+#[test]
+fn explorer_review_completed_move_stays_inspectable_until_acknowledged() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let services = Arc::new(Services::with_state_directory(state.path().to_owned()));
+    let mut engine = Engine::new();
+    engine.services = services.clone();
+    engine.runtime = Arc::new(Runtime::new(services, engine.documents.clone()));
+    let path = dir.path().join("before");
+    let to = dir.path().join("after");
+    std::fs::write(&path, b"kept").unwrap();
+    let observed = value(&engine, json!({"command":"fs.observe","path":path}));
+    let reply = value(
+        &engine,
+        json!({"command":"fs.rename","root":dir.path(),"path":path,"to":to,"observed":observed["observed"],"operation":OperationID([96;16])}),
+    );
+    assert!(reply["receipt"]["state"].get("Confirmed").is_some());
+    let pending = value(&engine, json!({"command":"fs.pending"}));
+    assert_eq!(
+        pending["entries"].as_array().unwrap().len(),
+        1,
+        "Discarded delivery must not lose its recovery reference"
+    );
+    let inspected = value(
+        &engine,
+        json!({"command":"fs.inspect_operation","operation":OperationID([96;16])}),
+    );
+    assert_eq!(inspected["resolved"], true);
+    assert_eq!(std::fs::read(to).unwrap(), b"kept");
+}
+#[test]
+fn explorer_review_move_can_leave_workspace_without_overwriting() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let workspace = dir.path().join("project");
+    std::fs::create_dir(&workspace).unwrap();
+    let services = Arc::new(Services::with_state_directory(state.path().to_owned()));
+    let mut engine = Engine::new();
+    engine.services = services.clone();
+    engine.runtime = Arc::new(Runtime::new(services, engine.documents.clone()));
+    let path = workspace.join("before");
+    let to = dir.path().join("after");
+    std::fs::write(&path, b"kept").unwrap();
+    let observed = value(&engine, json!({"command":"fs.observe","path":path}));
+    let reply = value(
+        &engine,
+        json!({"command":"fs.rename","root":workspace,"path":path,"to":to,"observed":observed["observed"],"operation":OperationID([97;16])}),
+    );
+    assert!(reply["receipt"]["state"].get("Confirmed").is_some());
+    assert_eq!(std::fs::read(to).unwrap(), b"kept");
+}
+
+#[cfg(unix)]
+#[test]
+fn explorer_capabilities_resolves_aliased_workspace_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("project");
+    let alias = dir.path().join("alias");
+    std::fs::create_dir(&root).unwrap();
+    std::os::unix::fs::symlink(&root, &alias).unwrap();
+    let engine = Engine::new();
+    let reply = value(
+        &engine,
+        json!({"command":"fs.explorer_capabilities","root":alias}),
+    );
+    assert_eq!(
+        reply["root_path"],
+        std::fs::canonicalize(root).unwrap().to_str().unwrap()
+    );
+}

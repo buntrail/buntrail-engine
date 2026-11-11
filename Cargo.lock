@@ -34,9 +34,9 @@ dependencies = [
 
 [[package]]
 name = "buntrail-core"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a7226135696f6d5c11cd31fe34e13f8f63d78bff0f791b9370ce486a8576bad"
+checksum = "1a314b652a7e8bfdabb8955f84236e508b70f015d48443b2de3db3e73a0d7eae"
 dependencies = [
  "futures-core",
  "regex",
@@ -46,7 +46,7 @@ dependencies = [
 
 [[package]]
 name = "buntrail-engine"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "base64",
  "buntrail-core",
@@ -63,9 +63,9 @@ dependencies = [
 
 [[package]]
 name = "buntrail-language"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0002aa450c1aa9a189534ab6395f47d909b4c8ba3dc47a1703a667eb87809211"
+checksum = "d117f0008c24e4480c87191e4c2cf7c9e929164073a0f4e5cb12c6b6a8aafd18"
 dependencies = [
  "buntrail-core",
  "cc",
@@ -94,9 +94,9 @@ dependencies = [
 
 [[package]]
 name = "buntrail-protocol"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6044e39e31d9693620227b1f7d6b9fd62c35b837d9a3cb2e7a16d73134291bb7"
+checksum = "d928e7efc897f8d8fd90e4eaa5f145229e86da983e35f889643344bf1f48f00f"
 dependencies = [
  "base64",
  "buntrail-core",
@@ -107,9 +107,9 @@ dependencies = [
 
 [[package]]
 name = "buntrail-services"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "37f4b5bc8dbbff55ce0edb96dad642cbf78e333940ba73c8cf71de1bdaf4467c"
+checksum = "bc5fc7d467db999df59aa165d0531fb95ff5bb8e5042fb81f929a450a6e31be7"
 dependencies = [
  "base64",
  "buntrail-core",

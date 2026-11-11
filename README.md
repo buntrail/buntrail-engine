@@ -12,7 +12,7 @@ Add to your Cargo.toml after the initial registry release:
 
 ```toml
 [dependencies]
-buntrail-engine = "0.2.0"
+buntrail-engine = "0.3.0"
 ```
 
 ```rust

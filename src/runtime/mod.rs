@@ -11,6 +11,7 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
     task::{Context as TaskContext, Poll, Waker},
 };
+mod explorer_adapter;
 mod files_adapter;
 mod git_adapter;
 mod search_adapter;
@@ -419,6 +420,20 @@ impl Runtime {
         {
             return self.git_call(None, request, cancellation);
         }
+        if request["command"].as_str().is_some_and(|c| {
+            matches!(
+                c,
+                "fs.import"
+                    | "fs.pending"
+                    | "fs.inspect_operation"
+                    | "fs.trash"
+                    | "fs.explorer_capabilities"
+            ) || (c.starts_with("fs.")
+                && request.get("root").is_some()
+                && matches!(c, "fs.create" | "fs.mkdir" | "fs.rename" | "fs.remove"))
+        }) {
+            return self.explorer_call(None, request);
+        }
         if request["command"]
             .as_str()
             .is_some_and(|c| c.starts_with("fs."))
@@ -553,6 +568,19 @@ impl Runtime {
                     );
                 }
                 let _admission = self.document_admission()?;
+                if request["request"]["command"].as_str().is_some_and(|c| {
+                    matches!(
+                        c,
+                        "fs.pending"
+                            | "fs.inspect_operation"
+                            | "fs.trash"
+                            | "fs.explorer_capabilities"
+                            | "fs.import"
+                    ) || (request["request"].get("root").is_some()
+                        && matches!(c, "fs.create" | "fs.mkdir" | "fs.rename" | "fs.remove"))
+                }) {
+                    return self.explorer_call(Some(string(request, "id")?), &request["request"]);
+                }
                 self.files_call(
                     &remote,
                     request

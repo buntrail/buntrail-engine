@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.0
+
+File-sidebar operations and compatible shared core contracts. C ABI remains version 1.
+
 ## 0.2.1 — Unreleased
 
 Allow terminal.start to choose an absolute UTF-8 launch directory independently
