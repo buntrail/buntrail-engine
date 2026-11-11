@@ -83,7 +83,9 @@ impl Runtime {
                     .resolve_git_recovery(reference.owner.workspace, &reference)
                     .map_err(error)?;
             }
-            return Ok(json!({"receipt":receipt,"resolved":resolved(&receipt.state)}));
+            return Ok(
+                json!({"receipt":receipt,"resolved":resolved(&receipt.state),"repository_action":reference.repository_action}),
+            );
         }
         let root = FileRef {
             target: target.clone(),
@@ -93,6 +95,71 @@ impl Runtime {
         let worktree = backend
             .discover(root)?
             .ok_or_else(|| fail("not_git", "This folder is not a Git worktree"))?;
+        if command == "git.repository" || command == "git.merge_state" {
+            let snapshot = match &remote {
+                Some(s) => run(s.repository(worktree)),
+                None => local.git.repository_sync(worktree, &cancel),
+            }
+            .map_err(error)?;
+            if command == "git.merge_state" {
+                return Ok(json!(snapshot.merge));
+            }
+            let pending = local.store.load().map(|catalog| {
+                catalog
+                    .records
+                    .into_iter()
+                    .flat_map(|w| w.git_recoveries)
+                    .filter(|p| p.worktree == snapshot.worktree)
+                    .map(|p| p.operation)
+                    .collect::<Vec<_>>()
+            });
+            let mut value = json!(snapshot);
+            match pending {
+                Ok(entries) => value["pending_operations"] = json!(entries),
+                Err(error) => {
+                    value["pending_operations"] = Value::Null;
+                    value["pending_error"] = json!(error.message);
+                }
+            }
+            return Ok(value);
+        }
+        if command == "git.commit" {
+            let query = CommitQuery {
+                worktree,
+                oid: string(r, "oid")?.into(),
+                cursor: r
+                    .get("cursor")
+                    .filter(|v| !v.is_null())
+                    .map(|v| {
+                        v.as_u64()
+                            .ok_or_else(|| fail("invalid_request", "Invalid file cursor"))
+                    })
+                    .transpose()?,
+            };
+            return Ok(json!(
+                match &remote {
+                    Some(s) => run(s.commit(query)),
+                    None => local.git.commit_sync(query, &cancel),
+                }
+                .map_err(error)?
+            ));
+        }
+        if command == "git.commit_diff" {
+            let path: TargetPath = serde_json::from_value(r["path"].clone())
+                .map_err(|e| fail("invalid_request", e.to_string()))?;
+            let query = DiffRequest {
+                worktree,
+                path,
+                source: DiffSource::Commit(string(r, "oid")?.into()),
+            };
+            return Ok(json!(
+                match &remote {
+                    Some(s) => run(s.diff(query)),
+                    None => local.git.diff_sync(query, &cancel),
+                }
+                .map_err(error)?
+            ));
+        }
         if command == "git.history" {
             let refs = r
                 .get("refs")
@@ -111,6 +178,14 @@ impl Runtime {
                 })
                 .transpose()?;
             let query = HistoryQuery {
+                filter: r
+                    .get("filter")
+                    .filter(|v| !v.is_null())
+                    .map(|v| {
+                        serde_json::from_value(v.clone())
+                            .map_err(|e| fail("invalid_request", e.to_string()))
+                    })
+                    .transpose()?,
                 worktree,
                 ref_filter: refs,
                 cursor,
@@ -123,27 +198,78 @@ impl Runtime {
                 .map_err(error)?
             ));
         }
-        let args = r["args"]
-            .as_array()
-            .ok_or_else(|| fail("invalid_request", "Git args must be an array"))?
-            .iter()
-            .map(|v| {
-                v.as_str()
-                    .ok_or_else(|| fail("invalid_request", "Git args must be strings"))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        if let Some(query) = GitRead::from_args(&args) {
-            let output = backend.read(worktree, query)?;
-            return Ok(
-                json!({"stdout":String::from_utf8_lossy(&output.stdout),"stderr":String::from_utf8_lossy(&output.stderr),"status":if output.success {0}else{1},"truncated":false}),
-            );
-        }
+        let args = if command != "git.mutate" {
+            let args = r["args"]
+                .as_array()
+                .ok_or_else(|| fail("invalid_request", "Git args must be an array"))?
+                .iter()
+                .map(|v| {
+                    v.as_str()
+                        .ok_or_else(|| fail("invalid_request", "Git args must be strings"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if let Some(query) = GitRead::from_args(&args) {
+                let output = backend.read(worktree, query)?;
+                return Ok(
+                    json!({"stdout":String::from_utf8_lossy(&output.stdout),"stderr":String::from_utf8_lossy(&output.stderr),"status":if output.success{0}else{1},"truncated":false}),
+                );
+            }
+            Some(args)
+        } else {
+            None
+        };
         let initial = backend.status(worktree.clone())?;
-        let mutation = mutation(&backend, &worktree, &initial.state, &args)?;
-        let changing = matches!(
-            mutation,
-            GitMutation::Checkout { .. } | GitMutation::PullFastForward { .. }
-        );
+        let mutation = if let Some(args) = args {
+            mutation(&backend, &worktree, &initial.state, &args)?
+        } else {
+            let ExpectedState::Git {
+                worktree: observed,
+                state: expected,
+            } = serde_json::from_value(r["expected"].clone())
+                .map_err(|e| fail("invalid_request", e.to_string()))?
+            else {
+                return Err(fail(
+                    "invalid_request",
+                    "Expected a Git repository observation",
+                ));
+            };
+            if observed != worktree {
+                return Err(fail(
+                    "target_changed",
+                    "Repository identity changed; refresh and review this repository before applying an action",
+                ));
+            }
+            if initial.state != expected {
+                return Err(fail(
+                    "stale_revision",
+                    "Repository changed; refresh before applying this action",
+                ));
+            }
+            GitMutation::Repository(
+                serde_json::from_value(r["action"].clone())
+                    .map_err(|e| fail("invalid_request", e.to_string()))?,
+            )
+        };
+        if matches!(mutation, GitMutation::Repository(_))
+            && let Some(remote) = &remote
+        {
+            remote.require_repository().map_err(error)?;
+        }
+        if local
+            .store
+            .load()
+            .map_err(error)?
+            .records
+            .iter()
+            .flat_map(|w| &w.git_recoveries)
+            .any(|p| p.worktree == worktree)
+        {
+            return Err(fail(
+                "mutation_uncertain",
+                "Inspect pending Git operations for this repository before another mutation",
+            ));
+        }
+        let changing = mutation.changes_worktree();
         let staging = matches!(mutation, GitMutation::Stage(_));
         let _exclusive = if changing || staging {
             Some(self.admission.try_write().map_err(|_| {
@@ -207,6 +333,15 @@ impl Runtime {
         } else {
             initial.state.clone()
         };
+        if let Err(error) = validate_repository_observation(&mutation, &initial.state, &expected) {
+            if let Some((authority, observed)) = &local_observation {
+                local.git.release_observation(authority, observed.id);
+            }
+            if let Some(observed) = &remote_observation {
+                let _ = remote.as_ref().unwrap().release_observation(observed.id);
+            }
+            return Err(error);
+        }
         if matches!(mutation, GitMutation::PullFastForward { .. })
             && expected.head != initial.state.head
         {
@@ -223,6 +358,7 @@ impl Runtime {
             command: mutation,
         };
         let kind = match request.command {
+            GitMutation::Repository(_) => GitRecoveryKind::Repository,
             GitMutation::Stage(_) => GitRecoveryKind::Stage,
             GitMutation::Unstage(_) => GitRecoveryKind::Unstage,
             GitMutation::Commit { .. } => GitRecoveryKind::Commit,
@@ -232,6 +368,10 @@ impl Runtime {
             GitMutation::PullFastForward { .. } => GitRecoveryKind::Pull,
         };
         let reference = GitRecoveryReference {
+            repository_action: match &request.command {
+                GitMutation::Repository(action) => Some(action.clone()),
+                _ => None,
+            },
             operation,
             worktree,
             kind,
@@ -345,8 +485,25 @@ impl Runtime {
         Self::validate_git_receipt(&reference, &receipt)?;
         let resolved = resolved(&receipt.state);
         let success = matches!(receipt.state, OperationState::Confirmed(_));
+        if matches!(
+            &receipt.state,
+            OperationState::Failed(OperationFailure {
+                effect: FailureEffect::ProvenNoEffect,
+                ..
+            })
+        ) {
+            local
+                .store
+                .resolve_git_recovery(reference.owner.workspace, &reference)
+                .map_err(error)?;
+        }
+        let diagnostic = match &receipt.state {
+            OperationState::Failed(failure) => failure.error.message.clone(),
+            OperationState::Unknown(evidence) => evidence.explanation.clone(),
+            _ => "Inspect this operation before continuing".into(),
+        };
         Ok(
-            json!({"stdout":if success {"Git operation confirmed"}else{""},"stderr":if success {String::new()}else{format!("{:?}\n{}",receipt.state,if resolved {"Operation failed without effects"}else{"Inspect this operation before retrying"})},"status":if success{0}else{1},"truncated":false,"operation":operation,"receipt":receipt,"pending":!resolved}),
+            json!({"stdout":if success {"Git operation confirmed"}else{""},"stderr":if success {String::new()}else{diagnostic},"status":if success{0}else{1},"truncated":false,"operation":operation,"receipt":receipt,"pending":!resolved}),
         )
     }
     fn validate_git_receipt(
@@ -499,4 +656,44 @@ fn mutation(
             ));
         }
     })
+}
+
+fn validate_repository_observation(
+    mutation: &GitMutation,
+    approved: &GitExpectedState,
+    captured: &GitExpectedState,
+) -> Result<()> {
+    if matches!(mutation, GitMutation::Repository(_)) && approved != captured {
+        return Err(fail(
+            "stale_revision",
+            "Repository changed after confirmation; refresh and review the changes before applying this action",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod repository_observation_tests {
+    use super::*;
+    #[test]
+    fn abort_cannot_adopt_saved_edits_after_confirmation() {
+        let approved = GitExpectedState {
+            head: GitHead::Branch {
+                name: b"refs/heads/main".to_vec(),
+                oid: "a".repeat(40),
+            },
+            index_fingerprint: [1; 32],
+            worktree_fingerprint: [2; 32],
+        };
+        let mut saved = approved.clone();
+        saved.worktree_fingerprint = [3; 32];
+        let abort = GitMutation::Repository(RepositoryAction::AbortMerge {
+            session: OperationID([4; 16]),
+        });
+        assert!(
+            validate_repository_observation(&abort, &approved, &saved).is_err(),
+            "newly saved tracked edits were never listed in the abort confirmation"
+        );
+        assert!(validate_repository_observation(&abort, &approved, &approved).is_ok());
+    }
 }

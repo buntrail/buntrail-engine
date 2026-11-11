@@ -1,5 +1,12 @@
 //! Authoritative document and workspace orchestration.
 //!
+//! `terminal.start` accepts an optional `directory` JSON string: an absolute,
+//! NUL-free UTF-8 launch path on the selected target. Omission uses the verified
+//! workspace `root`. The directory does not change workspace identity, ownership,
+//! lease or runtime. Malformed supplied values (including null) are errors before
+//! terminal layout changes. Launch failures retain existing uncertain-operation
+//! handling; callers must inspect rather than retry uncertain starts.
+//!
 //! See the repository README for usage, prerequisites and platform limitations.
 //! Authoritative documents with worker-routed local and remote services.
 mod document;

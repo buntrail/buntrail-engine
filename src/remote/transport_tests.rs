@@ -2696,3 +2696,74 @@ fn actual_helper_existing_only_streams_all_large_originals_without_replay() {
     assert_eq!(remote.connection_state(), ConnectionState::Ready);
     crate::worker::run(Box::pin(remote.close_connection()));
 }
+
+#[test]
+fn old_repository_capability_refuses_before_frames_and_preserves_connection() {
+    let (_server, mut remote, file) = fixture();
+    remote.transport.capabilities = Arc::new(
+        remote
+            .negotiated_capabilities()
+            .iter()
+            .filter(|c| c.as_str() != "git.repository.v1")
+            .cloned()
+            .collect(),
+    );
+    let ids = remote.transport.ids.load(Ordering::SeqCst);
+    let worktree = WorktreeIdentity {
+        target: remote.target.clone(),
+        canonical_path: file.path,
+        common_git_directory_identity: vec![],
+    };
+    assert_eq!(
+        run(GitService::repository(&remote, worktree.clone()))
+            .unwrap_err()
+            .code,
+        ErrorCode::Unavailable
+    );
+    assert_eq!(
+        run(GitService::commit(
+            &remote,
+            CommitQuery {
+                worktree: worktree.clone(),
+                oid: "a".repeat(40),
+                cursor: None
+            }
+        ))
+        .unwrap_err()
+        .code,
+        ErrorCode::Unavailable
+    );
+    let original = GitMutationRequest {
+        operation: OperationID([203; 16]),
+        worktree,
+        expected: GitExpectedState {
+            head: GitHead::Unborn(b"main".to_vec()),
+            index_fingerprint: [0; 32],
+            worktree_fingerprint: [0; 32],
+        },
+        command: GitMutation::Repository(RepositoryAction::SwitchBranch {
+            name: b"main".to_vec(),
+            expected_oid: "a".repeat(40),
+        }),
+    };
+    assert_eq!(
+        run(GitService::existing_receipt(&remote, original.clone()))
+            .unwrap_err()
+            .code,
+        ErrorCode::Unavailable
+    );
+    assert!(matches!(
+        run(GitService::mutate(&remote, original)).state,
+        OperationState::Failed(OperationFailure {
+            effect: FailureEffect::ProvenNoEffect,
+            ..
+        })
+    ));
+    assert_eq!(
+        remote.transport.ids.load(Ordering::SeqCst),
+        ids,
+        "old helpers must receive no new repository frames"
+    );
+    assert_eq!(remote.connection_state(), ConnectionState::Ready);
+    crate::worker::run(Box::pin(remote.close_connection()));
+}

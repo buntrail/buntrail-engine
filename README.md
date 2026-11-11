@@ -12,7 +12,7 @@ Add to your Cargo.toml after the initial registry release:
 
 ```toml
 [dependencies]
-buntrail-engine = "0.1.0"
+buntrail-engine = "0.2.0"
 ```
 
 ```rust
@@ -49,3 +49,17 @@ Report vulnerabilities privately using [SECURITY.md](SECURITY.md).
 First-party code is [MIT licensed](LICENSE), Copyright (c) 2026 Bunga Mungil.
 Third-party dependencies retain their own licenses. See
 [third-party notices](THIRD_PARTY_NOTICES.md).
+
+Terminal workspace layouts and launch descriptors are session-only. Workspace catalogs retain documents and verified ownership, but do not restore terminals after an application restart. Remote disconnect retention is independent of catalog persistence.
+
+### Terminal launch directory
+
+`terminal.start` accepts `directory` as an optional absolute, NUL-free UTF-8
+string. For example, `{"command":"terminal.start","root":"/work/project",
+"directory":"/work/project/nested folder/日本語"}` launches there while retaining
+the verified `/work/project` workspace identity. Omit the field to use the root;
+null, nonstrings, relative paths and NUL bytes are errors before layout changes.
+This uses the existing typed terminal request on local and remote routes; it
+does not alter the C ABI or remote wire contract. Filesystem launch failures
+keep existing receipt/uncertain-operation handling. Do not replay an uncertain
+launch. Directory selection does not grant new target or ownership authority.

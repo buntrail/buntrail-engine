@@ -298,7 +298,7 @@ impl Runtime {
             }
             for (id, remote) in matches {
                 let _ = remote.detach_workspace();
-                self.terminals.lock().unwrap().detach(&id);
+                self.terminals.lock().unwrap().detach(&id, true);
                 self.registry.lock().unwrap().remotes.remove(&id);
                 if let Some(owner) = remote.physical() {
                     run(owner.wait_unused());
@@ -576,7 +576,7 @@ impl Runtime {
                     }
                     true
                 };
-                self.terminals.lock().unwrap().detach(id);
+                self.terminals.lock().unwrap().detach(id, detach);
                 let saved = {
                     let mut registry = self
                         .registry

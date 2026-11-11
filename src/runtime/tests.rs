@@ -689,7 +689,7 @@ fn silent_remote_detachment_has_a_bounded_unconfirmed_result() {
 }
 
 #[test]
-fn old_local_terminal_layout_does_not_launch_a_missing_process() {
+fn terminal_layout_is_memory_only_and_restart_is_empty() {
     let root = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
     let make = || {
@@ -704,6 +704,33 @@ fn old_local_terminal_layout_does_not_launch_a_missing_process() {
         &engine,
         json!({"command":"terminal.start","root":root.path(),"shell":"/bin/sh"}),
     );
+    let before = value(
+        &engine,
+        json!({"command":"terminal.layout","root":root.path()}),
+    );
+    value(
+        &engine,
+        json!({"command":"workspace.snapshot","root":root.path(),"documents":[]}),
+    );
+    let after = value(
+        &engine,
+        json!({"command":"terminal.layout","root":root.path()}),
+    );
+    assert_eq!(before["tabs"], after["tabs"]);
+    assert!(
+        engine
+            .runtime
+            .services
+            .local_connection()
+            .unwrap()
+            .store
+            .load()
+            .unwrap()
+            .records[0]
+            .terminal_layout
+            .tabs
+            .is_empty()
+    );
     value(&engine, json!({"command":"workspace.shutdown"}));
     drop(engine);
     let engine = make();
@@ -711,15 +738,10 @@ fn old_local_terminal_layout_does_not_launch_a_missing_process() {
         &engine,
         json!({"command":"terminal.layout","root":root.path()}),
     );
-    assert_eq!(layout["tabs"].as_array().unwrap().len(), 1);
+    assert!(layout["tabs"].as_array().unwrap().is_empty());
     assert_eq!(
-        engine.call(json!({"command":"terminal.attach","id":started["id"],"sequence":0}))["error"]
-            ["code"],
-        "runtime_lost"
-    );
-    value(
-        &engine,
-        json!({"command":"terminal.layout.close","id":started["id"]}),
+        engine.call(json!({"command":"terminal.attach","id":started["id"],"sequence":0}))["ok"],
+        false
     );
 }
 
@@ -828,4 +850,209 @@ fn explorer_remove_is_nonrecursive_on_local_and_framed_routes() {
         assert_eq!(response["ok"], true, "{response}");
         assert!(!root.exists());
     }
+}
+
+#[test]
+fn disconnected_terminal_context_survives_verified_route_replacement() {
+    let (server, engine, path) = fixture();
+    let old = engine.runtime.route("fixture").unwrap();
+    let owner = old.lease().clone();
+    let target = old.target().clone();
+    let locator = engine.runtime.registry.lock().unwrap().remotes["fixture"]
+        .locator
+        .clone();
+    let root = path.parent().unwrap();
+    let started = value(
+        &engine,
+        json!({"command":"remote.call","id":"fixture","request":{"command":"terminal.start","root":root,"shell":"/bin/sh"}}),
+    );
+    value(&engine, json!({"command":"remote.detach","id":"fixture"}));
+    assert_eq!(engine.call(json!({"command":"remote.call","id":"fixture","request":{"command":"terminal.write","id":started["id"],"text":"unsafe"}}))["ok"], false);
+    drop(old);
+    let remote = Arc::new(
+        RemoteServices::connect(
+            server.connect(),
+            target,
+            owner,
+            server.dir.path().join("new-spools"),
+        )
+        .unwrap(),
+    );
+    remote.set_authentication(None).unwrap();
+    engine.runtime.registry.lock().unwrap().remotes.insert(
+        "replacement".into(),
+        Route {
+            services: remote,
+            _owner: None,
+            locator,
+        },
+    );
+    let layout = value(
+        &engine,
+        json!({"command":"remote.call","id":"replacement","request":{"command":"terminal.layout","root":root}}),
+    );
+    assert_eq!(layout["tabs"], started["layout"]["tabs"]);
+    value(
+        &engine,
+        json!({"command":"remote.call","id":"replacement","request":{"command":"terminal.attach","id":started["id"],"sequence":0}}),
+    );
+    value(
+        &engine,
+        json!({"command":"remote.call","id":"replacement","request":{"command":"terminal.close","id":started["id"]}}),
+    );
+}
+
+#[test]
+fn repository_browsing_and_prepared_actions_cross_framed_routes() {
+    let (_server, engine, base) = fixture();
+    let root = base.parent().unwrap().join("repository-new");
+    std::fs::create_dir(&root).unwrap();
+    for args in [
+        vec!["init", "-b", "main"],
+        vec!["config", "user.name", "Fixture"],
+        vec!["config", "user.email", "fixture@example.invalid"],
+        vec!["config", "commit.gpgsign", "false"],
+        vec!["config", "core.hooksPath", ".git/hooks"],
+    ] {
+        assert!(
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    std::fs::write(root.join("file"), b"one\r\n").unwrap();
+    for args in [
+        vec!["add", "file"],
+        vec!["commit", "-m", "repository fixture"],
+    ] {
+        assert!(
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    for remote in [false, true] {
+        let call = |request: Value| {
+            value(
+                &engine,
+                if remote {
+                    json!({"command":"remote.call","id":"fixture","request":request})
+                } else {
+                    request
+                },
+            )
+        };
+        let snapshot = call(json!({"command":"git.repository","root":root}));
+        let head = &snapshot["state"]["head"]["Branch"];
+        let oid = head["oid"].as_str().unwrap();
+        let name = if remote {
+            "remote-topic"
+        } else {
+            "local-topic"
+        };
+        let expected = json!({"Git":{"state":snapshot["state"],"worktree":snapshot["worktree"]}});
+        let create = call(
+            json!({"command":"git.mutate","root":root,"expected":expected,"action":{"CreateBranch":{"name":name.as_bytes(),"source_ref":head["name"],"start_oid":oid}}}),
+        );
+        assert_eq!(create["status"], 0, "{create}");
+        assert_eq!(
+            call(json!({"command":"git.inspect","operation":create["operation"]}))["resolved"],
+            true
+        );
+        let history = call(
+            json!({"command":"git.history","root":root,"filter":{"authored_since":null,"text":"REPOSITORY FIXTURE"}}),
+        );
+        assert_eq!(history["commits"].as_array().unwrap().len(), 1);
+        let detail = call(json!({"command":"git.commit","root":root,"oid":oid}));
+        let path = &detail["files"][0]["path"];
+        let diff = call(json!({"command":"git.commit_diff","root":root,"oid":oid,"path":path}));
+        assert_eq!(diff["content"], "Text");
+        let switch = call(
+            json!({"command":"git.mutate","root":root,"expected":expected,"action":{"SwitchBranch":{"name":name.as_bytes(),"expected_oid":oid}}}),
+        );
+        assert_eq!(switch["status"], 0, "{switch}");
+        assert_eq!(
+            call(json!({"command":"git.inspect","operation":switch["operation"]}))["resolved"],
+            true
+        );
+        let updated = call(json!({"command":"git.repository","root":root}));
+        assert_eq!(
+            updated["state"]["head"]["Branch"]["name"],
+            json!(format!("refs/heads/{name}").as_bytes())
+        );
+        assert_eq!(std::fs::read(root.join("file")).unwrap(), b"one\r\n");
+    }
+}
+
+#[test]
+fn terminal_start_remote_directory_retains_authority_and_shell_cwd() {
+    let (_server, engine, path) = fixture();
+    let root = path.parent().unwrap();
+    let directory = root.join("nested folder/日本語");
+    std::fs::create_dir_all(&directory).unwrap();
+    let request =
+        json!({"command":"terminal.start","root":root,"directory":directory,"shell":"/bin/sh"});
+    let workspace = engine
+        .runtime
+        .terminal_workspace(Some("fixture"), &request)
+        .unwrap();
+    let (before, owner) = {
+        let w = workspace.lock().unwrap();
+        (w.record.clone(), w.owner.clone())
+    };
+    let created = value(
+        &engine,
+        json!({"command":"remote.call","id":"fixture","request":request}),
+    );
+    {
+        let w = workspace.lock().unwrap();
+        assert_eq!(w.record.id, before.id);
+        assert_eq!(w.record.locator, before.locator);
+        assert_eq!(w.record.target, before.target);
+        assert_eq!(w.owner, owner);
+        assert_eq!(
+            w.record.terminal_starts[0].directory,
+            TargetPath::posix(directory.to_str().unwrap().as_bytes().to_vec()).unwrap()
+        );
+    }
+    value(
+        &engine,
+        json!({"command":"remote.call","id":"fixture","request":{"command":"terminal.write","id":created["id"],"text":"printf '\\nCWD='; /bin/pwd; exit\n"}}),
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut bytes = Vec::new();
+    loop {
+        let read = value(
+            &engine,
+            json!({"command":"remote.call","id":"fixture","request":{"command":"terminal.read","id":created["id"]}}),
+        );
+        bytes.extend(
+            read["bytes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|n| n.as_u64().unwrap() as u8),
+        );
+        if read["drained"] == true {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let expected = std::fs::canonicalize(directory).unwrap();
+    assert!(
+        String::from_utf8_lossy(&bytes).contains(&format!("CWD={}\r\n", expected.display())),
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    value(
+        &engine,
+        json!({"command":"remote.call","id":"fixture","request":{"command":"terminal.close","id":created["id"]}}),
+    );
 }
