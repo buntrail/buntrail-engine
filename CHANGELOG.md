@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.0 — Git sidebar
+
+Expose local/framed sidebar history, commit summaries, Index/Worktree diffs and mutually exclusive typed mutations through existing admission and durable inspection.
+
 ## 0.3.0
 
 File-sidebar operations and compatible shared core contracts. C ABI remains version 1.
