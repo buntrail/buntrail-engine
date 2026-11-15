@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.2 — Lossless Git snapshots
+
+Align first-party dependencies with the lossless Git snapshot correction; no API changes in this crate.
+
 ## 0.4.1 — Failed-push review
 
 Add guarded acknowledgment of inspected, observed completed failed pushes without replay or changing the original receipt. Unknown outcomes remain pending.
