@@ -697,7 +697,7 @@ fn mutation(
                     ));
                 }
             };
-            let full = [b"refs/heads/".as_slice(), branch].concat();
+            let full = branch.clone();
             let output = backend.read(worktree.clone(), GitRead::Upstream)?;
             if !output.success {
                 return Err(fail("unavailable", "Cannot read branch upstream"));

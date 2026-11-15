@@ -1043,6 +1043,59 @@ fn repository_browsing_and_prepared_actions_cross_framed_routes() {
             updated["state"]["head"]["Branch"]["name"],
             json!(format!("refs/heads/{name}").as_bytes())
         );
+        let bare = root.parent().unwrap().join(format!("{name}.git"));
+        std::fs::create_dir(&bare).unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "--bare"])
+                .current_dir(&bare)
+                .status()
+                .unwrap()
+                .success()
+        );
+        for args in [
+            vec![
+                "config".to_owned(),
+                "remote.work.url".into(),
+                bare.to_str().unwrap().into(),
+            ],
+            vec![
+                "config".into(),
+                "remote.work.fetch".into(),
+                "+refs/heads/*:refs/remotes/work/*".into(),
+            ],
+            vec![
+                "config".into(),
+                format!("branch.{name}.remote"),
+                "work".into(),
+            ],
+            vec![
+                "config".into(),
+                format!("branch.{name}.merge"),
+                "refs/heads/main".into(),
+            ],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(&root)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        for args in [
+            json!(["push"]),
+            json!(["fetch"]),
+            json!(["pull", "--ff-only"]),
+        ] {
+            let operation = call(json!({"command":"git","root":root,"args":args}));
+            assert_eq!(operation["status"], 0, "{operation}");
+            assert_eq!(
+                call(json!({"command":"git.inspect","operation":operation["operation"]}))["resolved"],
+                true
+            );
+        }
         assert_eq!(std::fs::read(root.join("file")).unwrap(), b"one\r\n");
     }
 }
