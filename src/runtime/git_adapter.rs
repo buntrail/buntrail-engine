@@ -95,6 +95,83 @@ impl Runtime {
         let worktree = backend
             .discover(root)?
             .ok_or_else(|| fail("not_git", "This folder is not a Git worktree"))?;
+        if command == "git.acknowledge_push" {
+            let operation: OperationID = serde_json::from_value(r["operation"].clone())
+                .map_err(|e| fail("invalid_request", e.to_string()))?;
+            let supplied: OperationReceipt = serde_json::from_value(r["receipt"].clone())
+                .map_err(|e| fail("invalid_request", e.to_string()))?;
+            let ExpectedState::Git {
+                worktree: observed,
+                state: expected,
+            } = serde_json::from_value(r["expected"].clone())
+                .map_err(|e| fail("invalid_request", e.to_string()))?
+            else {
+                return Err(fail(
+                    "invalid_request",
+                    "Expected a fresh Git worktree observation",
+                ));
+            };
+            if observed != worktree {
+                return Err(fail(
+                    "target_changed",
+                    "Push acknowledgment belongs to another worktree or target",
+                ));
+            }
+            let reference = local
+                .store
+                .load()
+                .map_err(error)?
+                .records
+                .into_iter()
+                .flat_map(|w| w.git_recoveries)
+                .find(|p| {
+                    p.operation == operation
+                        && p.worktree == worktree
+                        && p.kind == GitRecoveryKind::Push
+                })
+                .ok_or_else(|| {
+                    fail(
+                        "not_found",
+                        "Retained Push not found for this verified worktree",
+                    )
+                })?;
+            let receipt = match &remote {
+                Some(s) => run(s.inspect(operation, target.clone())),
+                None => run(local.files.inspect(operation, target.clone())),
+            }
+            .map_err(error)?;
+            Self::validate_git_receipt(&reference, &receipt)?;
+            if receipt != supplied {
+                return Err(fail(
+                    "stale_revision",
+                    "Push receipt changed; inspect it again before acknowledgment",
+                ));
+            }
+            if !matches!(&receipt.state,
+                OperationState::Failed(OperationFailure {
+                    effect: FailureEffect::PossiblePartialEffects,
+                    observed: ObservedState::GitNetwork { worktree: observed, intent, observation: Some(_), .. },
+                    ..
+                }) if observed == &worktree && intent.action == GitNetworkAction::Push)
+            {
+                return Err(fail(
+                    "mutation_uncertain",
+                    "Only an observed completed failed Push can be acknowledged; unknown or running outcomes remain pending",
+                ));
+            }
+            if backend.status(worktree)?.state != expected {
+                return Err(fail(
+                    "stale_revision",
+                    "Repository changed; refresh and review before acknowledging the failed Push",
+                ));
+            }
+            // Acknowledgment retires only the recovery reference; the original receipt is immutable.
+            local
+                .store
+                .resolve_git_recovery(reference.owner.workspace, &reference)
+                .map_err(error)?;
+            return Ok(json!({"acknowledged":true,"operation":operation,"receipt":receipt}));
+        }
         if command == "git.repository" || command == "git.merge_state" {
             let snapshot = match &remote {
                 Some(s) => run(s.repository(worktree)),

@@ -75,3 +75,5 @@ its existing expected Git worktree/state observation. Typed mutations pass
 through the same dirty-document admission, durable receipt and pending-operation
 inspection flow. Do not replay uncertain mutations. Sidebar reads require
 `git.sidebar.v1`; older helpers remain usable for their negotiated capabilities.
+
+`git.acknowledge_push` accepts a verified worktree root, operation, fresh Git expected state and exact inspected receipt. It retires only the retained recovery reference for an observed completed failed Push after explicit user review; it never mutates Git or changes the original receipt. Unknown, running and unobserved outcomes stay pending.

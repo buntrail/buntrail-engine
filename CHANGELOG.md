@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.1 — Failed-push review
+
+Add guarded acknowledgment of inspected, observed completed failed pushes without replay or changing the original receipt. Unknown outcomes remain pending.
+
 ## 0.4.0 — Git sidebar
 
 Expose local/framed sidebar history, commit summaries, Index/Worktree diffs and mutually exclusive typed mutations through existing admission and durable inspection. Correct full-reference lookup for legacy checked-out branch network actions.

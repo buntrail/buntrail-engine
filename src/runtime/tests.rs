@@ -1411,3 +1411,255 @@ fn explorer_capabilities_resolves_aliased_workspace_root() {
         std::fs::canonicalize(root).unwrap().to_str().unwrap()
     );
 }
+
+#[test]
+fn git_sidebar_failed_push_acknowledgment_is_guarded_and_never_replays() {
+    use buntrail_core::workspaces::GitRecoveryKind;
+    use std::os::unix::fs::PermissionsExt;
+    let (server, engine, _) = fixture();
+    let git = |root: &std::path::Path, args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+    for remote in [false, true] {
+        let root = server
+            .dir
+            .path()
+            .join(if remote { "ack-remote" } else { "ack-local" });
+        let bare = server.dir.path().join(if remote {
+            "ack-remote.git"
+        } else {
+            "ack-local.git"
+        });
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&bare).unwrap();
+        git(&root, &["init", "-b", "main"]);
+        git(&bare, &["init", "--bare"]);
+        for args in [
+            ["config", "user.name", "Fixture"],
+            ["config", "user.email", "fixture@example.invalid"],
+            ["config", "commit.gpgsign", "false"],
+            ["config", "core.hooksPath", ".git/hooks"],
+        ] {
+            git(&root, &args);
+        }
+        git(&root, &["commit", "--allow-empty", "-m", "one"]);
+        git(&root, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        let before = root.join(".git/hooks/pre-push");
+        std::fs::write(&before, b"#!/bin/sh\necho attempt >> .git/ack-push-count\n").unwrap();
+        std::fs::set_permissions(&before, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let rejection = bare.join("hooks/pre-receive");
+        std::fs::write(&rejection, b"#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&rejection, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let call = |request: Value| {
+            engine.call(if remote {
+                json!({"command":"remote.call","id":"fixture","request":request})
+            } else {
+                request
+            })
+        };
+        let ok = |request: Value| {
+            let result = call(request);
+            assert_eq!(result["ok"], true, "{result}");
+            result["value"].clone()
+        };
+        let snapshot = ok(json!({"command":"git.repository","root":root}));
+        let expected = json!({"Git":{"worktree":snapshot["worktree"],"state":snapshot["state"]}});
+        let mutation = json!({"Push":{"remote":b"origin","reference":b"refs/heads/main"}});
+        let failed =
+            ok(json!({"command":"git.mutate","root":root,"expected":expected,"mutation":mutation}));
+        assert_eq!(failed["status"], 1);
+        let inspected = ok(json!({"command":"git.inspect","operation":failed["operation"]}));
+        assert_eq!(inspected["resolved"], false);
+        let receipt = inspected["receipt"].clone();
+        let fresh = ok(json!({"command":"git.repository","root":root}));
+        let expected = json!({"Git":{"worktree":fresh["worktree"],"state":fresh["state"]}});
+        let acknowledge = json!({"command":"git.acknowledge_push","root":root,"operation":failed["operation"],"expected":expected,"receipt":receipt});
+        let mut forged = acknowledge.clone();
+        forged["receipt"]["id"] = json!(vec![0; 16]);
+        assert_eq!(call(forged)["ok"], false);
+        let mut stale = acknowledge.clone();
+        stale["expected"]["Git"]["state"]["index_fingerprint"][0] =
+            json!(fresh["state"]["index_fingerprint"][0].as_u64().unwrap() ^ 1);
+        assert_eq!(call(stale)["ok"], false);
+        let mut target = acknowledge.clone();
+        target["expected"]["Git"]["worktree"]["target"]["effective_user"] = json!([255]);
+        assert_eq!(call(target)["ok"], false);
+        let mut path = acknowledge.clone();
+        path["root"] = json!(bare);
+        assert_eq!(call(path)["ok"], false);
+        let other = root.with_extension("other");
+        std::fs::create_dir(&other).unwrap();
+        git(&other, &["init", "-b", "main"]);
+        let other_snapshot = ok(json!({"command":"git.repository","root":other}));
+        let mut alternate = acknowledge.clone();
+        alternate["root"] = json!(other);
+        alternate["expected"] =
+            json!({"Git":{"worktree":other_snapshot["worktree"],"state":other_snapshot["state"]}});
+        assert_eq!(
+            call(alternate)["ok"],
+            false,
+            "A valid alternate worktree cannot retire the original reference"
+        );
+        let local = engine.runtime.services.local_connection().unwrap();
+        let operation: OperationID = serde_json::from_value(failed["operation"].clone()).unwrap();
+        let reference = local
+            .store
+            .load()
+            .unwrap()
+            .records
+            .into_iter()
+            .flat_map(|w| w.git_recoveries)
+            .find(|r| r.operation == operation)
+            .unwrap();
+        local
+            .store
+            .resolve_git_recovery(reference.owner.workspace, &reference)
+            .unwrap();
+        let mut wrong_kind = reference.clone();
+        wrong_kind.kind = GitRecoveryKind::Fetch;
+        local
+            .store
+            .retain_git_recovery(reference.owner.workspace, wrong_kind.clone())
+            .unwrap();
+        assert_eq!(
+            call(acknowledge.clone())["ok"],
+            false,
+            "An authoritative wrong-kind reference cannot be acknowledged"
+        );
+        assert!(
+            ok(json!({"command":"git.repository","root":root}))["pending_operations"]
+                .as_array()
+                .unwrap()
+                .contains(&failed["operation"])
+        );
+        local
+            .store
+            .resolve_git_recovery(reference.owner.workspace, &wrong_kind)
+            .unwrap();
+        local
+            .store
+            .retain_git_recovery(reference.owner.workspace, reference)
+            .unwrap();
+        if !remote {
+            let ledger = buntrail_services::operations::ledger::Ledger::open(
+                server.dir.path().join("client/files/operations"),
+            )
+            .unwrap();
+            let mut record = ledger.read(operation).unwrap().unwrap();
+            let original = record.receipt.clone();
+            if let OperationState::Failed(failure) = &mut record.receipt.state {
+                if let ObservedState::GitNetwork { observation, .. } = &mut failure.observed {
+                    *observation = None;
+                } else {
+                    panic!("Expected network failure");
+                }
+            } else {
+                panic!("Expected failed receipt");
+            }
+            ledger.write(&record).unwrap();
+            let mut unobserved = acknowledge.clone();
+            unobserved["receipt"] = serde_json::to_value(&record.receipt).unwrap();
+            assert_eq!(
+                call(unobserved)["ok"],
+                false,
+                "An authoritative failure without a network observation stays pending"
+            );
+            assert!(
+                ok(json!({"command":"git.repository","root":root}))["pending_operations"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&failed["operation"])
+            );
+            record.receipt = original;
+            ledger.write(&record).unwrap();
+        }
+        let before_attempts = std::fs::read(root.join(".git/ack-push-count")).unwrap();
+        assert_eq!(ok(acknowledge)["acknowledged"], true);
+        assert_eq!(
+            std::fs::read(root.join(".git/ack-push-count")).unwrap(),
+            before_attempts,
+            "Acknowledgment cannot execute another push"
+        );
+        let after = ok(json!({"command":"git.repository","root":root}));
+        assert!(after["pending_operations"].as_array().unwrap().is_empty());
+        if !remote {
+            let local = engine.runtime.services.local_connection().unwrap();
+            let operation: OperationID =
+                serde_json::from_value(failed["operation"].clone()).unwrap();
+            assert_eq!(
+                serde_json::to_value(
+                    local
+                        .files
+                        .inspect_sync(operation, local.identity.clone())
+                        .unwrap()
+                )
+                .unwrap(),
+                receipt,
+                "Original durable receipt remains immutable"
+            );
+        }
+        std::fs::remove_file(rejection).unwrap();
+        let retry_expected = json!({"Git":{"worktree":after["worktree"],"state":after["state"]}});
+        let count = git(&root, &["rev-list", "--count", "HEAD"]);
+        let pushed = ok(
+            json!({"command":"git.mutate","root":root,"expected":retry_expected,"mutation":mutation}),
+        );
+        assert_eq!(pushed["status"], 0);
+        assert_eq!(
+            ok(json!({"command":"git.inspect","operation":pushed["operation"]}))["resolved"],
+            true
+        );
+        assert_eq!(git(&root, &["rev-list", "--count", "HEAD"]), count);
+        assert_eq!(
+            git(&bare, &["rev-parse", "refs/heads/main"]),
+            git(&root, &["rev-parse", "HEAD"])
+        );
+        if !remote {
+            git(&root, &["commit", "--allow-empty", "-m", "two"]);
+            let hook = bare.join("hooks/post-receive");
+            std::fs::write(
+                &hook,
+                b"#!/bin/sh\necho received > ack-received\nsleep 20\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let fresh = ok(json!({"command":"git.repository","root":root}));
+            let request = json!({"command":"git.mutate","root":root,"expected":{"Git":{"worktree":fresh["worktree"],"state":fresh["state"]}},"mutation":mutation});
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let signal = cancel.clone();
+            let runtime = engine.runtime.clone();
+            let worker =
+                std::thread::spawn(move || runtime.git_call(None, &request, Some(signal)).unwrap());
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !bare.join("ack-received").exists() && std::time::Instant::now() < until {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(bare.join("ack-received").exists());
+            cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            let interrupted = worker.join().unwrap();
+            let inspection =
+                ok(json!({"command":"git.inspect","operation":interrupted["operation"]}));
+            assert_eq!(inspection["resolved"], false);
+            assert!(inspection["receipt"]["state"].get("Unknown").is_some());
+            let fresh = ok(json!({"command":"git.repository","root":root}));
+            assert_eq!(
+                call(
+                    json!({"command":"git.acknowledge_push","root":root,"operation":interrupted["operation"],"expected":{"Git":{"worktree":fresh["worktree"],"state":fresh["state"]}},"receipt":inspection["receipt"]})
+                )["ok"],
+                false,
+                "Unknown push must remain blocked"
+            );
+        }
+    }
+}
