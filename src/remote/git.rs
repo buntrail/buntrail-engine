@@ -1,5 +1,19 @@
 use super::*;
 impl RemoteServices {
+    pub(crate) fn require_sidebar(&self) -> Result<(), CoreError> {
+        if !self
+            .negotiated_capabilities()
+            .iter()
+            .any(|v| v == "git.sidebar.v1")
+        {
+            return Err(CoreError::new(
+                ErrorCode::Unavailable,
+                "Active helper lacks Git sidebar support; preserve retained sessions and update after they end",
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn require_repository(&self) -> Result<(), CoreError> {
         if !self
             .negotiated_capabilities()
@@ -15,6 +29,62 @@ impl RemoteServices {
     }
 }
 impl GitService for RemoteServices {
+    fn sidebar_history(
+        &self,
+        query: GitSidebarHistoryQuery,
+    ) -> ServiceFuture<'_, Result<GraphPage, CoreError>> {
+        Box::pin(async move {
+            self.check(&query.worktree.target)?;
+            self.require_sidebar()?;
+            match self.call(
+                w::Call::SidebarHistory {
+                    worktree: w::Worktree::from_core(&query.worktree)?,
+                    scope: w::HistoryScope::from_core(&query.scope)?,
+                    cursor: query.cursor.as_ref().map(|v| B64.encode(v)),
+                },
+                None,
+            )? {
+                w::Reply::History {
+                    commits,
+                    continuation_edges,
+                    next_cursor,
+                } => Ok(GraphPage {
+                    commits: commits
+                        .iter()
+                        .map(w::Commit::core)
+                        .collect::<Result<_, _>>()?,
+                    continuation_edges,
+                    next_cursor: next_cursor
+                        .map(|v| B64.decode(v).map_err(|_| w::invalid()))
+                        .transpose()?,
+                }),
+                _ => Err(w::invalid()),
+            }
+        })
+    }
+    fn commit_summary(
+        &self,
+        query: CommitQuery,
+    ) -> ServiceFuture<'_, Result<GitCommitSummary, CoreError>> {
+        Box::pin(async move {
+            self.check(&query.worktree.target)?;
+            self.require_sidebar()?;
+            if query.cursor.is_some() {
+                return Err(w::invalid());
+            }
+            match self.call(
+                w::Call::CommitSummary {
+                    worktree: w::Worktree::from_core(&query.worktree)?,
+                    oid: query.oid.clone(),
+                },
+                None,
+            )? {
+                w::Reply::CommitSummary { summary } if summary.oid == query.oid => Ok(summary),
+                _ => Err(w::invalid()),
+            }
+        })
+    }
+
     fn repository(
         &self,
         worktree: WorktreeIdentity,

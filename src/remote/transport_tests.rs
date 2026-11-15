@@ -2767,3 +2767,51 @@ fn old_repository_capability_refuses_before_frames_and_preserves_connection() {
     assert_eq!(remote.connection_state(), ConnectionState::Ready);
     crate::worker::run(Box::pin(remote.close_connection()));
 }
+
+#[test]
+fn git_sidebar_old_helper_refuses_without_sending_or_losing_sessions() {
+    let (_server, mut remote, file) = fixture();
+    remote.transport.capabilities = Arc::new(
+        remote
+            .negotiated_capabilities()
+            .iter()
+            .filter(|c| c.as_str() != "git.sidebar.v1")
+            .cloned()
+            .collect(),
+    );
+    let ids = remote.transport.ids.load(Ordering::SeqCst);
+    let worktree = WorktreeIdentity {
+        target: remote.target.clone(),
+        canonical_path: file.path,
+        common_git_directory_identity: vec![],
+    };
+    assert_eq!(
+        run(GitService::sidebar_history(
+            &remote,
+            GitSidebarHistoryQuery {
+                worktree: worktree.clone(),
+                scope: GitHistoryScope::All,
+                cursor: None
+            }
+        ))
+        .unwrap_err()
+        .code,
+        ErrorCode::Unavailable
+    );
+    assert_eq!(
+        run(GitService::commit_summary(
+            &remote,
+            CommitQuery {
+                worktree,
+                oid: "a".repeat(40),
+                cursor: None
+            }
+        ))
+        .unwrap_err()
+        .code,
+        ErrorCode::Unavailable
+    );
+    assert_eq!(remote.transport.ids.load(Ordering::SeqCst), ids);
+    assert_eq!(remote.connection_state(), ConnectionState::Ready);
+    crate::worker::run(Box::pin(remote.close_connection()));
+}

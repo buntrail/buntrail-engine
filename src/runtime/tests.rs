@@ -969,10 +969,67 @@ fn repository_browsing_and_prepared_actions_cross_framed_routes() {
             json!({"command":"git.history","root":root,"filter":{"authored_since":null,"text":"REPOSITORY FIXTURE"}}),
         );
         assert_eq!(history["commits"].as_array().unwrap().len(), 1);
+        let scoped = call(json!({"command":"git.sidebar_history","root":root,"scope":"All"}));
+        assert_eq!(scoped["commits"].as_array().unwrap().len(), 1);
+        let summary = call(json!({"command":"git.commit_summary","root":root,"oid":oid}));
+        assert_eq!(summary["changed_file_count"], 1);
+        assert_eq!(summary["insertion_count"], 1);
         let detail = call(json!({"command":"git.commit","root":root,"oid":oid}));
         let path = &detail["files"][0]["path"];
         let diff = call(json!({"command":"git.commit_diff","root":root,"oid":oid,"path":path}));
         assert_eq!(diff["content"], "Text");
+        let working_diff =
+            call(json!({"command":"git.diff","root":root,"path":path,"source":"Worktree"}));
+        assert_eq!(working_diff["content"], "Text");
+        let response = |request: Value| {
+            engine.call(if remote {
+                json!({"command":"remote.call","id":"fixture","request":request})
+            } else {
+                request
+            })
+        };
+        for scope in [json!({"References":[]}), json!({"References":[[0]]})] {
+            assert_eq!(
+                response(json!({"command":"git.sidebar_history","root":root,"scope":scope}))["ok"],
+                false
+            );
+        }
+        assert_eq!(
+            response(
+                json!({"command":"git.mutate","root":root,"expected":expected,"action":{"DeleteBranch":{"name":name.as_bytes(),"expected_oid":oid}},"mutation":{"Commit":{"message":"ambiguous"}}})
+            )["ok"],
+            false
+        );
+        std::fs::write(root.join("file"), b"two\r\n").unwrap();
+        assert_eq!(
+            response(
+                json!({"command":"git.mutate","root":root,"expected":expected,"mutation":{"Stage":[path]}})
+            )["error"]["code"],
+            "stale_revision"
+        );
+        let fresh = call(json!({"command":"git.repository","root":root}));
+        let observation = json!({"Git":{"state":fresh["state"],"worktree":fresh["worktree"]}});
+        let stage = call(
+            json!({"command":"git.mutate","root":root,"expected":observation,"mutation":{"Stage":[path]}}),
+        );
+        assert_eq!(stage["status"], 0);
+        assert_eq!(
+            call(json!({"command":"git.inspect","operation":stage["operation"]}))["resolved"],
+            true
+        );
+        let staged = call(json!({"command":"git.diff","root":root,"path":path,"source":"Index"}));
+        assert_eq!(staged["content"], "Text");
+        assert!(!staged["bytes"].as_array().unwrap().is_empty());
+        assert!(
+            std::process::Command::new("git")
+                .args(["restore", "--staged", "--worktree", "file"])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let restored = call(json!({"command":"git.repository","root":root}));
+        let expected = json!({"Git":{"state":restored["state"],"worktree":restored["worktree"]}});
         let switch = call(
             json!({"command":"git.mutate","root":root,"expected":expected,"action":{"SwitchBranch":{"name":name.as_bytes(),"expected_oid":oid}}}),
         );

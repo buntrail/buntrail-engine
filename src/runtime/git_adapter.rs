@@ -123,6 +123,69 @@ impl Runtime {
             }
             return Ok(value);
         }
+        if command == "git.sidebar_history" {
+            let scope: GitHistoryScope = serde_json::from_value(r["scope"].clone())
+                .map_err(|e| fail("invalid_request", e.to_string()))?;
+            scope.validate().map_err(error)?;
+            let cursor = r
+                .get("cursor")
+                .filter(|v| !v.is_null())
+                .map(|v| {
+                    serde_json::from_value(v.clone())
+                        .map_err(|e| fail("invalid_request", e.to_string()))
+                })
+                .transpose()?;
+            let query = GitSidebarHistoryQuery {
+                worktree,
+                scope,
+                cursor,
+            };
+            return Ok(json!(
+                match &remote {
+                    Some(s) => run(s.sidebar_history(query)),
+                    None => local.git.sidebar_history_sync(query, &cancel),
+                }
+                .map_err(error)?
+            ));
+        }
+        if command == "git.commit_summary" {
+            let query = CommitQuery {
+                worktree,
+                oid: string(r, "oid")?.into(),
+                cursor: None,
+            };
+            return Ok(json!(
+                match &remote {
+                    Some(s) => run(s.commit_summary(query)),
+                    None => local.git.commit_summary_sync(query, &cancel),
+                }
+                .map_err(error)?
+            ));
+        }
+        if command == "git.diff" {
+            let path: TargetPath = serde_json::from_value(r["path"].clone())
+                .map_err(|e| fail("invalid_request", e.to_string()))?;
+            let source: DiffSource = serde_json::from_value(r["source"].clone())
+                .map_err(|e| fail("invalid_request", e.to_string()))?;
+            if !matches!(source, DiffSource::Index | DiffSource::Worktree) {
+                return Err(fail(
+                    "invalid_request",
+                    "Expected Index or Worktree diff source",
+                ));
+            }
+            let query = DiffRequest {
+                worktree,
+                path,
+                source,
+            };
+            return Ok(json!(
+                match &remote {
+                    Some(s) => run(s.diff(query)),
+                    None => local.git.diff_sync(query, &cancel),
+                }
+                .map_err(error)?
+            ));
+        }
         if command == "git.commit" {
             let query = CommitQuery {
                 worktree,
@@ -245,10 +308,20 @@ impl Runtime {
                     "Repository changed; refresh before applying this action",
                 ));
             }
-            GitMutation::Repository(
-                serde_json::from_value(r["action"].clone())
+            match (r.get("action"), r.get("mutation")) {
+                (Some(action), None) => GitMutation::Repository(
+                    serde_json::from_value(action.clone())
+                        .map_err(|e| fail("invalid_request", e.to_string()))?,
+                ),
+                (None, Some(mutation)) => serde_json::from_value(mutation.clone())
                     .map_err(|e| fail("invalid_request", e.to_string()))?,
-            )
+                _ => {
+                    return Err(fail(
+                        "invalid_request",
+                        "Supply exactly one action or typed mutation",
+                    ));
+                }
+            }
         };
         if matches!(mutation, GitMutation::Repository(_))
             && let Some(remote) = &remote

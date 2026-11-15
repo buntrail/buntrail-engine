@@ -63,3 +63,15 @@ This uses the existing typed terminal request on local and remote routes; it
 does not alter the C ABI or remote wire contract. Filesystem launch failures
 keep existing receipt/uncertain-operation handling. Do not replay an uncertain
 launch. Directory selection does not grant new target or ownership authority.
+
+### Git sidebar JSON
+
+The local and framed routes accept `git.sidebar_history {root,scope,cursor?}`,
+`git.commit_summary {root,oid}`, and `git.diff {root,path,source}`. Scope uses
+`"Head"`, `"All"`, or `{"References":[raw-byte-ref-arrays]}`; diff source is
+`"Index"` or `"Worktree"`, and path is an exact typed TargetPath.
+`git.mutate` accepts exactly one of legacy `action` or typed `mutation`, plus
+its existing expected Git worktree/state observation. Typed mutations pass
+through the same dirty-document admission, durable receipt and pending-operation
+inspection flow. Do not replay uncertain mutations. Sidebar reads require
+`git.sidebar.v1`; older helpers remain usable for their negotiated capabilities.
