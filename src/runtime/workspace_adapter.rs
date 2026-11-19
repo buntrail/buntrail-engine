@@ -42,6 +42,64 @@ impl Runtime {
         if command == "capabilities" {
             return Ok(capabilities);
         }
+        if command == "workspace.welcome_list" {
+            let path: TargetPath = serde_json::from_value(r["path"].clone())
+                .map_err(|_| fail("invalid_request", "Invalid directory path"))?;
+            let file = FileRef {
+                target,
+                path,
+                resolved_identity: None,
+            };
+            let resolution = match &remote {
+                Some(s) => run(s.resolve(file, FileResolvePurpose::Root)),
+                None => local.files.resolve_sync(file, FileResolvePurpose::Root),
+            }
+            .map_err(error)?;
+            let entries = match &remote {
+                Some(s) => run(s.list(resolution.root)),
+                None => local.files.list_sync(resolution.root),
+            }
+            .map_err(error)?;
+            let mut rows: Vec<_> = entries
+                .into_iter()
+                .filter(|e| e.kind == FileKind::Directory)
+                .map(|e| json!({"name":e.display_name,"path":e.file.path}))
+                .collect();
+            rows.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+            return Ok(json!({"path":resolution.resolved_path,"entries":rows}));
+        }
+        if command == "workspace.welcome_folder" {
+            let parent = string(r, "parent")?;
+            let name = r.get("name").map(|_| string(r, "name")).transpose()?;
+            let repository = r
+                .get("repository")
+                .map(|_| string(r, "repository"))
+                .transpose()?;
+            let path = if let Some(remote) = remote {
+                let file = FileRef {
+                    target,
+                    path: TargetPath::posix(parent.as_bytes().to_vec()).map_err(error)?,
+                    resolved_identity: None,
+                };
+                remote
+                    .welcome_folder(
+                        file,
+                        name.map(str::to_owned),
+                        repository.map(str::to_owned),
+                        OperationID(new_id().map_err(error)?),
+                    )
+                    .map_err(error)?
+            } else {
+                let child = buntrail_services::welcome_folder(
+                    std::path::Path::new(parent),
+                    name,
+                    repository,
+                )
+                .map_err(|e| fail("service_error", e))?;
+                TargetPath::posix(child.as_os_str().as_encoded_bytes().to_vec()).map_err(error)?
+            };
+            return Ok(json!({"path":path}));
+        }
         let catalog = local.store.load().map_err(error)?;
         if command == "workspace.catalog" {
             return Ok(json!({"client":catalog.client,"records":catalog.records}));
@@ -105,6 +163,16 @@ impl Runtime {
             Err(e) => return Err(error(e)),
         };
         let root = files_adapter::text_path(&resolution.resolved_path)?;
+        if command == "workspace.open"
+            && r["welcome"] == true
+            && let Some(remote) = &remote
+            && let Some(existing) = catalog.records.iter().find(|record| {
+                record.target == target && record.locator.root == resolution.resolved_path
+            })
+            && existing.id != remote.lease().workspace
+        {
+            return Ok(json!({"state":"Reconnect","workspace":existing.id}));
+        }
         let workspace = self.terminal_workspace(route, &json!({"root":root}))?;
         if let Some(saved) = &saved
             && workspace.lock().unwrap().record.id != saved.id

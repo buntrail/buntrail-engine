@@ -409,6 +409,7 @@ struct PromptClaim {
     waiter: Option<u64>,
 }
 struct Attempt {
+    parent_target: Option<TargetIdentity>,
     id: u64,
     prompt: Mutex<Option<PromptClaim>>,
     expected: Option<TargetIdentity>,
@@ -473,6 +474,7 @@ pub struct ConnectionPrompt {
     pub request: AuthenticationRequest,
 }
 pub struct ConnectRequest {
+    pub(crate) welcome: bool,
     permit: Arc<ConnectionPermit>,
     transition: Option<Arc<ConnectionPermit>>,
     resume_admission: Option<Arc<ResumeAdmission>>,
@@ -595,7 +597,24 @@ impl EnvironmentConnector {
         expected: Option<TargetIdentity>,
         resume: Option<WorkspaceLease>,
     ) -> Result<ConnectRequest, CoreError> {
-        self.start_admitted(locator, expected, resume, None, false, None, None)
+        self.start_admitted(locator, expected, resume, None, false, None, None, None)
+    }
+    pub(crate) fn start_nested(
+        &self,
+        locator: EnvironmentLocator,
+        expected: Option<TargetIdentity>,
+        parent: TargetIdentity,
+    ) -> Result<ConnectRequest, CoreError> {
+        self.start_admitted(
+            locator,
+            expected,
+            None,
+            None,
+            false,
+            None,
+            None,
+            Some(parent),
+        )
     }
     pub fn start_saved(
         &self,
@@ -609,6 +628,7 @@ impl EnvironmentConnector {
             false,
             Some((record.id, record.lease)),
             None,
+            None,
         )
     }
     pub fn start_observer(
@@ -616,7 +636,7 @@ impl EnvironmentConnector {
         locator: EnvironmentLocator,
         expected: TargetIdentity,
     ) -> Result<ConnectRequest, CoreError> {
-        self.start_admitted(locator, Some(expected), None, None, true, None, None)
+        self.start_admitted(locator, Some(expected), None, None, true, None, None, None)
     }
     // Independent saved/resume/registration/container identities must remain explicit at admission.
     #[allow(clippy::too_many_arguments)]
@@ -629,6 +649,7 @@ impl EnvironmentConnector {
         observer: bool,
         saved: Option<(WorkspaceID, WorkspaceLeaseID)>,
         selected_container: Option<SelectedContainer>,
+        parent_target: Option<TargetIdentity>,
     ) -> Result<ConnectRequest, CoreError> {
         let (permit, transition) = if let Some(existing) = existing {
             if !Arc::ptr_eq(&existing.budget, &self.budget) {
@@ -725,7 +746,10 @@ impl EnvironmentConnector {
             .and_then(|i| pool.entries[i].attempt.upgrade())
             .filter(|a| !a.cancel.load(Ordering::SeqCst));
         let attempt = if let Some(attempt) = existing {
-            if attempt.expected != expected || attempt.selected_container != selected_container {
+            if attempt.parent_target != parent_target
+                || attempt.expected != expected
+                || attempt.selected_container != selected_container
+            {
                 return Err(CoreError::new(
                     ErrorCode::Busy,
                     "a connection with another target expectation is in progress",
@@ -740,6 +764,7 @@ impl EnvironmentConnector {
                 ));
             }
             let attempt = Arc::new(Attempt {
+                parent_target: parent_target.clone(),
                 id: NEXT.fetch_add(1, Ordering::SeqCst),
                 prompt: Mutex::new(None),
                 expected: expected.clone(),
@@ -753,7 +778,9 @@ impl EnvironmentConnector {
             });
             let reusable = index
                 .and_then(|i| pool.entries[i].route.upgrade())
-                .filter(|r| r.connection_state() == ConnectionState::Ready);
+                .filter(|r| {
+                    r.connection_state() == ConnectionState::Ready && parent_target.is_none()
+                });
             let entry = PoolEntry {
                 locator: locator.clone(),
                 attempt: Arc::downgrade(&attempt),
@@ -825,6 +852,7 @@ impl EnvironmentConnector {
         }
         drop(pool);
         let mut request = ConnectRequest {
+            welcome: false,
             permit,
             transition,
             resume_admission,
@@ -1256,7 +1284,7 @@ fn connect_ssh(
         };
         let container = if let Some(engine) = locator.engine.as_ref() {
             let host = if let Some(ssh) = ssh.as_ref() {
-                EngineHost::ssh(ssh.clone())?
+                EngineHost::verified_ssh(ssh.clone(), attempt.parent_target.as_ref())?
             } else {
                 EngineHost::local(attempt.cancel.clone())?
             };
@@ -1386,4 +1414,4 @@ impl Drop for EnvironmentConnector {
 
 #[cfg(test)]
 #[path = "environment_tests.rs"]
-mod tests;
+pub(crate) mod tests;

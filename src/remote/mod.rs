@@ -138,6 +138,71 @@ impl RemoteServices {
     pub fn lease(&self) -> &WorkspaceLease {
         &self.lease
     }
+    pub(crate) fn welcome_containers(
+        &self,
+        engine: ContainerEngine,
+    ) -> Result<Vec<(String, String)>, CoreError> {
+        if !self
+            .negotiated_capabilities()
+            .iter()
+            .any(|c| c == "welcome.home")
+        {
+            return Err(w::invalid());
+        }
+        let w::Reply::WelcomeContainers { entries } =
+            self.call(w::Call::WelcomeContainers { engine }, None)?
+        else {
+            return Err(w::invalid());
+        };
+        Ok(entries)
+    }
+    pub(crate) fn welcome_folder(
+        &self,
+        parent: FileRef,
+        name: Option<String>,
+        repository: Option<String>,
+        operation: OperationID,
+    ) -> Result<TargetPath, CoreError> {
+        if !self
+            .negotiated_capabilities()
+            .iter()
+            .any(|c| c == "welcome.folder")
+        {
+            return Err(CoreError::new(
+                ErrorCode::Unavailable,
+                "Update the target helper to create a workspace",
+            ));
+        }
+        let w::Reply::WelcomeFolder { path_base64 } = self.call(
+            w::Call::WelcomeFolder {
+                parent: w::File::from_core(&parent)?,
+                name,
+                repository,
+            },
+            Some(operation),
+        )?
+        else {
+            return Err(w::invalid());
+        };
+        w::target_path(&path_base64)
+    }
+    pub(crate) fn welcome_home(&self) -> Result<TargetPath, CoreError> {
+        if !self
+            .negotiated_capabilities()
+            .iter()
+            .any(|c| c == "welcome.home")
+        {
+            return Err(CoreError::new(
+                ErrorCode::Unavailable,
+                "Update the target helper to browse its home directory",
+            ));
+        }
+        let w::Reply::WelcomeHome { path_base64 } = self.call(w::Call::WelcomeHome {}, None)?
+        else {
+            return Err(w::invalid());
+        };
+        w::target_path(&path_base64)
+    }
     pub fn target(&self) -> &TargetIdentity {
         &self.target
     }

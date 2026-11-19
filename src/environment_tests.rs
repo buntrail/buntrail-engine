@@ -18,9 +18,9 @@ fn locator() -> EnvironmentLocator {
         effective_user: None,
     }
 }
-struct Fixture {
+pub(crate) struct Fixture {
     _server: support::Server,
-    connector: EnvironmentConnector,
+    pub(crate) connector: EnvironmentConnector,
     attempt: Option<Arc<Attempt>>,
     anchor: Arc<RemoteServices>,
     retirement_started: Arc<AtomicBool>,
@@ -30,7 +30,7 @@ impl Fixture {
     fn new() -> Self {
         Self::using_local(None)
     }
-    fn using_local(existing: Option<Arc<LocalConnection>>) -> Self {
+    pub(crate) fn using_local(existing: Option<Arc<LocalConnection>>) -> Self {
         Self::using_transport(existing, false)
     }
     fn using_transport(existing: Option<Arc<LocalConnection>>, live_ssh: bool) -> Self {
@@ -125,6 +125,7 @@ impl Fixture {
         remote.physical().unwrap().ready();
         let anchor = Arc::new(remote);
         let attempt = Arc::new(Attempt {
+            parent_target: None,
             id: 41,
             prompt: Mutex::new(None),
             expected: None,
@@ -296,6 +297,7 @@ fn distinct_profile_cannot_replace_live_or_inflight_target_auth_policy() {
     let mut other = locator();
     other.ssh_profile = Some("another-saved-policy".into());
     let candidate = Arc::new(Attempt {
+        parent_target: None,
         id: 99,
         prompt: Mutex::new(None),
         expected: None,

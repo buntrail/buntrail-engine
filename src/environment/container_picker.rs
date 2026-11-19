@@ -298,6 +298,6 @@ impl EnvironmentConnector {
         let selected = inventory.selected(index)?;
         let mut locator = inventory.locator.clone();
         locator.container_selector = Some(selected.descriptor.immutable_id.clone());
-        self.start_admitted(locator, None, None, None, false, None, Some(selected))
+        self.start_admitted(locator, None, None, None, false, None, Some(selected), None)
     }
 }

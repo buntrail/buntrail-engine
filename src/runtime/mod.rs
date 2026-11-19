@@ -234,12 +234,25 @@ impl Runtime {
                 "Use local services for a local environment",
             ));
         }
-        let expected: Option<TargetIdentity> = request
+        let mut expected: Option<TargetIdentity> = request
             .get("expected")
             .filter(|v| !v.is_null())
             .map(|v| serde_json::from_value(v.clone()))
             .transpose()
             .map_err(|e| fail("invalid_request", e.to_string()))?;
+        if request["intent"] == "welcome" && request["new_target"] != true && expected.is_none() {
+            expected = self
+                .services
+                .local_connection()
+                .map_err(|e| fail("unavailable", e))?
+                .store
+                .load()
+                .map_err(error)?
+                .records
+                .into_iter()
+                .find(|record| record.locator.environment == locator)
+                .map(|record| record.target);
+        }
         let resume: Option<WorkspaceLease> = request
             .get("resume")
             .filter(|v| !v.is_null())
@@ -316,6 +329,33 @@ impl Runtime {
                 }
             }
         }
+        let parent = if let Some(id) = request.get("parent_connection") {
+            let id = id
+                .as_str()
+                .ok_or_else(|| fail("invalid_request", "Invalid parent connection"))?;
+            let target = self.verified_target(id)?;
+            let registry = self
+                .registry
+                .lock()
+                .map_err(|_| fail("engine_failed", "Remote registry poisoned"))?;
+            let route = registry
+                .remotes
+                .get(id)
+                .ok_or_else(|| fail("not_found", "Parent connection closed"))?;
+            if request["intent"] != "welcome"
+                || locator.route != RouteKind::SshContainer
+                || route.locator.route != RouteKind::Ssh
+                || locator.ssh_profile != route.locator.ssh_profile
+            {
+                return Err(fail(
+                    "wrong_target",
+                    "Choose a container on the selected SSH host",
+                ));
+            }
+            Some(target)
+        } else {
+            None
+        };
         let context = self.context()?;
         let mut registry = self
             .registry
@@ -324,7 +364,7 @@ impl Runtime {
         if registry.attempts.len() + registry.remotes.len() >= 32 {
             return Err(fail("busy", "Remote environment capacity reached"));
         }
-        let connect = if let Some(record) = saved {
+        let mut connect = if let Some(record) = saved {
             if let Some(owner) = resume {
                 context.connector.start(
                     record.locator.environment,
@@ -335,9 +375,14 @@ impl Runtime {
                 context.connector.start_saved(&record)
             }
         } else {
-            context.connector.start(locator, expected, resume)
+            if let Some(parent) = parent {
+                context.connector.start_nested(locator, expected, parent)
+            } else {
+                context.connector.start(locator, expected, resume)
+            }
         }
         .map_err(error)?;
+        connect.welcome = request["intent"] == "welcome";
         let id = registry.id("connection")?;
         registry
             .attempts
@@ -383,14 +428,27 @@ impl Runtime {
         match Pin::new(&mut *request).poll(&mut TaskContext::from_waker(Waker::noop())) {
             Poll::Pending => Ok(json!({"done":false,"state":state})),
             Poll::Ready(result) => {
+                self.registry
+                    .lock()
+                    .map_err(|_| fail("engine_failed", "Remote registry poisoned"))?
+                    .attempts
+                    .remove(id)
+                    .ok_or_else(|| fail("cancelled", "Connection attempt cancelled"))?;
+                let environment = result.map_err(error)?;
+                let home = if request.welcome {
+                    Some(environment.services.welcome_home().map_err(error)?)
+                } else {
+                    None
+                };
                 let mut registry = self
                     .registry
                     .lock()
                     .map_err(|_| fail("engine_failed", "Remote registry poisoned"))?;
-                registry.attempts.remove(id);
-                let environment = result.map_err(error)?;
                 let remote = registry.id("remote")?;
-                let value = json!({"done":true,"id":remote,"target":environment.services.target(),"runtime":environment.services.runtime(),"lease":environment.services.lease(),"locator":environment.locator});
+                let mut value = json!({"done":true,"id":remote,"target":environment.services.target(),"runtime":environment.services.runtime(),"lease":environment.services.lease(),"locator":environment.locator});
+                if let Some(home) = home {
+                    value["home"] = json!(home);
+                }
                 registry.remotes.insert(
                     remote,
                     Route {
@@ -551,6 +609,14 @@ impl Runtime {
                         || c == "capabilities"
                 }) {
                     return self.workspace_call(Some(string(request, "id")?), &request["request"]);
+                }
+                if request["request"]["command"] == "welcome.containers" {
+                    let engine: ContainerEngine =
+                        serde_json::from_value(request["request"]["engine"].clone())
+                            .map_err(|_| fail("invalid_request", "Choose Docker or Podman"))?;
+                    return Ok(
+                        json!({"entries":remote.welcome_containers(engine).map_err(error)?}),
+                    );
                 }
                 if request["request"]["command"] == "recovery.inspect" {
                     let document = serde_json::from_value(request["request"]["document"].clone())

@@ -774,6 +774,103 @@ fn workspace_preferences_are_validated_before_persistence() {
 }
 
 #[test]
+fn welcome_begin_poll_and_cancel_do_not_claim_workspace_or_history() {
+    let (_server, engine, _) = fixture();
+    let local = engine.runtime.services.local_connection().unwrap();
+    let fixture = crate::environment::tests::Fixture::using_local(Some(local));
+    assert!(
+        engine
+            .runtime
+            .context
+            .set(Ok(Arc::new(Context {
+                connector: fixture.connector.clone()
+            })))
+            .is_ok()
+    );
+    let before = value(&engine, json!({"command":"workspace.catalog"}));
+    let start = || {
+        value(
+            &engine,
+            json!({"command":"remote.begin","intent":"welcome","transport":"ssh","target":"internal-owned-unix"}),
+        )
+    };
+    let abandoned = start();
+    value(
+        &engine,
+        json!({"command":"remote.cancel","id":abandoned["id"]}),
+    );
+    assert_eq!(
+        engine.call(json!({"command":"remote.poll","id":abandoned["id"]}))["ok"],
+        false
+    );
+    let began = start();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let ready = loop {
+        let state = value(&engine, json!({"command":"remote.poll","id":began["id"]}));
+        if state["done"] == true {
+            break state;
+        }
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    assert!(ready["home"]["PosixBytes"].is_array() && ready["target"]["effective_user"].is_array());
+    assert_eq!(
+        value(&engine, json!({"command":"workspace.catalog"})),
+        before
+    );
+    value(&engine, json!({"command":"remote.detach","id":ready["id"]}));
+}
+
+#[test]
+fn welcome_actions_run_on_the_verified_route_and_refuse_collision() {
+    let (server, engine, _) = fixture();
+    let parent = server.dir.path();
+    let submit = |id: &str, name: &str| {
+        engine.call(json!({"command":"remote.call","id":id,
+        "request":{"command":"workspace.welcome_folder","parent":parent,"name":name}}))
+    };
+    assert_eq!(submit("retired", "wrong")["ok"], false);
+    assert!(!parent.join("wrong").exists());
+    let created = submit("fixture", "folder");
+    assert_eq!(created["ok"], true, "{created}");
+    assert!(parent.join("folder").is_dir());
+    assert_eq!(submit("fixture", "folder")["ok"], false);
+    let source = parent.join("rabbit.git");
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "--bare"])
+            .arg(&source)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let clone = value(
+        &engine,
+        json!({"command":"remote.call","id":"fixture",
+        "request":{"command":"workspace.welcome_folder","parent":parent,"repository":source}}),
+    );
+    assert!(clone.get("path").is_some() && parent.join("rabbit/.git").is_dir());
+    assert_eq!(
+        value(&engine, json!({"command":"workspace.catalog"}))["records"],
+        json!([])
+    );
+}
+
+#[test]
+fn welcome_home_comes_from_verified_helper_without_opening_workspace() {
+    let (_server, engine, _) = fixture();
+    let catalog = || value(&engine, json!({"command":"workspace.catalog"}));
+    let before = catalog();
+    let remote = engine.runtime.route("fixture").unwrap();
+    let home = remote.welcome_home().unwrap();
+    assert_eq!(
+        std::path::PathBuf::from(files_adapter::text_path(&home).unwrap()),
+        std::env::home_dir().unwrap()
+    );
+    assert_eq!(before, catalog());
+}
+
+#[test]
 fn reopening_a_ready_saved_remote_reuses_its_registration_and_cancel_is_harmless() {
     let (_server, engine, path) = fixture();
     let opened = value(
