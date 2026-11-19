@@ -774,6 +774,24 @@ fn workspace_preferences_are_validated_before_persistence() {
 }
 
 #[test]
+fn welcome_refuses_inaccessible_recent_before_registration() {
+    use std::os::unix::fs::PermissionsExt;
+    let (server, engine, _) = fixture();
+    let directory = server.dir.path().join("inaccessible");
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0)).unwrap();
+    let before = value(&engine, json!({"command":"workspace.catalog"}));
+    if unsafe { libc::geteuid() } != 0 {
+        let reply = engine.call(json!({"command":"remote.call","id":"fixture","request":{"command":"workspace.open","root":directory,"welcome":true}}));
+        assert_eq!(reply["ok"], false, "{reply}");
+        assert_eq!(
+            before,
+            value(&engine, json!({"command":"workspace.catalog"}))
+        );
+    }
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+}
+#[test]
 fn welcome_begin_poll_and_cancel_do_not_claim_workspace_or_history() {
     let (_server, engine, _) = fixture();
     let local = engine.runtime.services.local_connection().unwrap();

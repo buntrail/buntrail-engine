@@ -42,6 +42,16 @@ impl Runtime {
         if command == "capabilities" {
             return Ok(capabilities);
         }
+        if let Some(expected) = r.get("expected").filter(|v| !v.is_null()) {
+            let expected: TargetIdentity = serde_json::from_value(expected.clone())
+                .map_err(|e| fail("invalid_request", e.to_string()))?;
+            if expected != target {
+                return Err(fail(
+                    "wrong_target",
+                    "Saved workspace target differs from the verified environment",
+                ));
+            }
+        }
         if command == "workspace.welcome_list" {
             let path: TargetPath = serde_json::from_value(r["path"].clone())
                 .map_err(|_| fail("invalid_request", "Invalid directory path"))?;
@@ -104,16 +114,6 @@ impl Runtime {
         if command == "workspace.catalog" {
             return Ok(json!({"client":catalog.client,"records":catalog.records}));
         }
-        if let Some(expected) = r.get("expected").filter(|v| !v.is_null()) {
-            let expected: TargetIdentity = serde_json::from_value(expected.clone())
-                .map_err(|e| fail("invalid_request", e.to_string()))?;
-            if expected != target {
-                return Err(fail(
-                    "wrong_target",
-                    "Saved workspace target differs from the verified environment",
-                ));
-            }
-        }
         let saved = r
             .get("workspace")
             .map(|id| {
@@ -162,6 +162,17 @@ impl Runtime {
             Ok(_) => return Err(fail("not_found", "Workspace root is not a directory")),
             Err(e) => return Err(error(e)),
         };
+        if command == "workspace.open" && r["welcome"] == true {
+            let mut directory = resolution.root.clone();
+            if let TargetPath::PosixBytes(bytes) = &mut directory.path {
+                bytes.extend_from_slice(b"/.");
+            }
+            match &remote {
+                Some(s) => run(s.list(directory.clone())),
+                None => local.files.list_sync(directory),
+            }
+            .map_err(error)?;
+        }
         let root = files_adapter::text_path(&resolution.resolved_path)?;
         if command == "workspace.open"
             && r["welcome"] == true
