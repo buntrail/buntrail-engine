@@ -79,7 +79,17 @@ impl Runtime {
             return Ok(json!({"path":resolution.resolved_path,"entries":rows}));
         }
         if command == "workspace.welcome_folder" {
-            let parent = string(r, "parent")?;
+            use std::os::unix::ffi::OsStrExt;
+            let parent: TargetPath = if let Some(path) = r.get("parent_path") {
+                serde_json::from_value(path.clone())
+                    .map_err(|_| fail("invalid_request", "Invalid parent directory"))?
+            } else {
+                TargetPath::posix(string(r, "parent")?.as_bytes().to_vec()).map_err(error)?
+            };
+            let TargetPath::PosixBytes(bytes) = &parent else {
+                return Err(fail("invalid_request", "Choose a POSIX directory"));
+            };
+            TargetPath::posix(bytes.clone()).map_err(error)?;
             let name = r.get("name").map(|_| string(r, "name")).transpose()?;
             let repository = r
                 .get("repository")
@@ -88,7 +98,7 @@ impl Runtime {
             let path = if let Some(remote) = remote {
                 let file = FileRef {
                     target,
-                    path: TargetPath::posix(parent.as_bytes().to_vec()).map_err(error)?,
+                    path: parent,
                     resolved_identity: None,
                 };
                 remote
@@ -101,7 +111,7 @@ impl Runtime {
                     .map_err(error)?
             } else {
                 let child = buntrail_services::welcome_folder(
-                    std::path::Path::new(parent),
+                    std::path::Path::new(std::ffi::OsStr::from_bytes(bytes)),
                     name,
                     repository,
                 )
