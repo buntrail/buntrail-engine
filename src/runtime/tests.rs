@@ -779,7 +779,7 @@ fn welcome_refuses_inaccessible_recent_before_registration() {
     let (server, engine, _) = fixture();
     let directory = server.dir.path().join("inaccessible");
     std::fs::create_dir(&directory).unwrap();
-    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0)).unwrap();
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o000)).unwrap();
     let before = value(&engine, json!({"command":"workspace.catalog"}));
     if unsafe { libc::geteuid() } != 0 {
         let reply = engine.call(json!({"command":"remote.call","id":"fixture","request":{"command":"workspace.open","root":directory,"welcome":true}}));

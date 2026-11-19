@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.0
+
+Route workspace selection and writes through the selected connection.
+
 ## 0.4.2 — Lossless Git snapshots
 
 Align first-party dependencies with the lossless Git snapshot correction; no API changes in this crate.
