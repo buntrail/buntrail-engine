@@ -172,6 +172,16 @@ impl Runtime {
         })
     }
     fn begin(&self, request: &Value) -> Result<Value> {
+        if request["intent"] == "welcome"
+            && ["workspace", "root", "resume"]
+                .iter()
+                .any(|key| request.get(key).is_some())
+        {
+            return Err(fail(
+                "invalid_request",
+                "Welcome connections cannot specify a workspace",
+            ));
+        }
         let saved = if let Some(workspace) = request.get("workspace") {
             let id: WorkspaceID = serde_json::from_value(workspace.clone())
                 .map_err(|e| fail("invalid_request", e.to_string()))?;

@@ -780,6 +780,13 @@ fn reopening_a_ready_saved_remote_reuses_its_registration_and_cancel_is_harmless
         &engine,
         json!({"command":"remote.call","id":"fixture","request":{"command":"workspace.open","root":path.parent().unwrap()}}),
     );
+    assert_eq!(
+        engine.call(
+            json!({"command":"remote.begin","intent":"welcome","workspace":opened["record"]["id"]})
+        )["ok"],
+        false,
+        "Welcome must never acquire a rooted workspace registration",
+    );
     let mut wrong = opened["record"]["target"].clone();
     wrong["effective_user"] = json!([99]);
     assert_eq!(
