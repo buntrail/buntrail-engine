@@ -202,7 +202,18 @@ impl Engine {
                         .transpose()?,
                 );
             }
-            "document.discard_recovery" => return self.discard_document_recovery(number(r, "id")?),
+            "document.discard_recovery" => {
+                let retain_pending_save = r
+                    .get("retain_pending_save")
+                    .map(|flag| {
+                        flag.as_bool().ok_or_else(|| {
+                            fail("invalid_argument", "retain_pending_save must be a boolean")
+                        })
+                    })
+                    .transpose()?
+                    .unwrap_or(false);
+                return self.discard_document_recovery(number(r, "id")?, retain_pending_save);
+            }
             "document.inspect_save" => return self.inspect_save(number(r, "id")?),
             "document.close" => return self.close_document(number(r, "id")?, r["discard"] == true),
             _ => {}
@@ -784,6 +795,13 @@ mod recovery_save_tests {
     }
     #[test]
     fn lost_acknowledgement_is_inspected_without_replaying_save() {
+        lost_acknowledgement_discard(false);
+    }
+    #[test]
+    fn quit_discard_leaves_one_inspectable_save_after_restart() {
+        lost_acknowledgement_discard(true);
+    }
+    fn lost_acknowledgement_discard(restart: bool) {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("file");
         let engine = Engine::new();
@@ -794,6 +812,10 @@ mod recovery_save_tests {
         );
         let error = engine
             .save_with(id, |write, _| {
+                assert_eq!(
+                    engine.call(json!({"command":"document.discard_recovery","id":id,"retain_pending_save":true}))["error"]["code"],
+                    "save_pending"
+                );
                 let mut response = engine
                     .services
                     .save_document(&write)
@@ -822,8 +844,93 @@ mod recovery_save_tests {
             engine.call(json!({"command":"document.close","id":id,"discard":true}))["error"]["code"],
             "save_uncertain"
         );
+        assert_eq!(
+            engine.call(json!({"command":"document.discard_recovery","id":id}))["error"]["code"],
+            "save_uncertain"
+        );
+        let before = draft(&engine, &path);
+        value(
+            &engine,
+            json!({"command":"document.discard_recovery","id":id,"retain_pending_save":true}),
+        );
+        let document = &before["document"];
+        assert!(
+            engine
+                .services
+                .call(&json!({"command":"recovery.read","document":document}))
+                .is_err()
+        );
+        let inventory = engine
+            .services
+            .call(&json!({"command":"recovery.list"}))
+            .unwrap();
+        let entry = inventory["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["document"] == *document)
+            .unwrap();
+        assert_eq!(entry["recoverable"], false);
+        assert_eq!(entry["unknown_save"], true);
+        assert_eq!(entry["local"], true);
+        if restart {
+            value(&engine, json!({"command":"workspace.shutdown"}));
+            drop(engine);
+            let reopened = Engine::new();
+            let inventory = value(&reopened, json!({"command":"recovery.list"}));
+            let records: Vec<_> = inventory["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|entry| entry["document"] == *document)
+                .collect();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0]["active"], false);
+            assert_eq!(records[0]["recoverable"], false);
+            assert_eq!(records[0]["unknown_save"], true);
+            value(
+                &reopened,
+                json!({"command":"recovery.inspect","document":document}),
+            );
+            let inventory = value(&reopened, json!({"command":"recovery.list"}));
+            assert!(
+                !inventory["entries"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|entry| entry["document"] == *document)
+            );
+            assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+            assert_eq!(std::fs::read(&path).unwrap(), b"submitted");
+            return;
+        }
+        let bytes: Vec<u8> = serde_json::from_value(document.clone()).unwrap();
+        let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        let journal = engine
+            .services
+            .storage_directory()
+            .unwrap()
+            .join("files/recovery")
+            .join(format!("{hex}.draft"));
+        let held = journal.with_extension("held");
+        std::fs::rename(&journal, &held).unwrap();
+        std::fs::create_dir(&journal).unwrap();
+        let failed = engine.call(
+            json!({"command":"document.discard_recovery","id":id,"retain_pending_save":true}),
+        );
+        std::fs::remove_dir(&journal).unwrap();
+        std::fs::rename(&held, &journal).unwrap();
+        assert_eq!(failed["error"]["code"], "recovery_failed");
+        value(
+            &engine,
+            json!({"command":"document.edit","id":id,"revision":1,"start":9,"end":9,"text":" later"}),
+        );
+        value(&engine, json!({"command":"document.recovery","id":id}));
+        let restored = draft(&engine, &path);
+        assert_eq!(restored["document"], *document);
+        assert_eq!(restored["text"], "submitted later");
         let inspected = value(&engine, json!({"command":"document.inspect_save","id":id}));
-        assert_eq!(inspected["dirty"], false);
+        assert_eq!(inspected["dirty"], true);
         assert!(inspected["pending_operation"].is_null());
         assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
         assert_eq!(std::fs::read(&path).unwrap(), b"submitted");

@@ -22,8 +22,12 @@ impl Engine {
         }
         Ok(json!({"written":true}))
     }
-    pub(super) fn discard_document_recovery(&self, id: u64) -> Result<Value> {
-        let (journal, snapshot) = {
+    pub(super) fn discard_document_recovery(
+        &self,
+        id: u64,
+        retain_pending_save: bool,
+    ) -> Result<Value> {
+        let (journal, snapshot, metadata_only) = {
             let mut documents = self.documents()?;
             let document = documents
                 .open
@@ -32,23 +36,35 @@ impl Engine {
             if document.saving || document.closing {
                 return Err(fail("save_pending", "Wait for the pending operation"));
             }
-            if document.pending_save.is_some() {
+            let metadata_only = document
+                .pending_save
+                .is_some_and(|pending| pending.uncertain)
+                && retain_pending_save;
+            if document.pending_save.is_some() && !metadata_only {
                 return Err(fail(
                     "save_uncertain",
                     "Inspect the uncertain save before discarding recovery",
                 ));
             }
-            let snapshot = document.recovery_snapshot(true)?;
+            let snapshot = document.recovery_snapshot(!metadata_only)?;
             document.recovery_owner = document
                 .recovery_owner
                 .checked_add(1)
                 .ok_or_else(|| fail("exhausted", "Recovery ownership exhausted"))?;
             document.closing = true;
-            let used = document.journal.retire();
-            (document.journal.clone(), if used { snapshot } else { None })
+            let write = metadata_only || document.journal.retire();
+            (
+                document.journal.clone(),
+                if write { snapshot } else { None },
+                metadata_only,
+            )
         };
         let result = if let Some(snapshot) = snapshot {
-            self.services.write_recovery(&journal, snapshot)
+            if metadata_only {
+                self.services.retain_recovery_save(&journal, snapshot)
+            } else {
+                self.services.write_recovery(&journal, snapshot)
+            }
         } else {
             Ok(())
         };
@@ -62,7 +78,9 @@ impl Engine {
             journal.activate();
             return Err(fail("recovery_failed", error));
         }
-        document.journal = Arc::new(buntrail_services::recovery::journal::Journal::new());
+        if !metadata_only {
+            document.journal = Arc::new(buntrail_services::recovery::journal::Journal::new());
+        }
         Ok(Value::Null)
     }
     pub(super) fn rotate_recovery(&self, document: &mut crate::document::Document) -> Result<()> {

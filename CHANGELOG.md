@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.1
+
+Allow explicit quit discard to preserve an uncertain save reference without retrying the save.
+
 ## 0.5.0
 
 Route workspace selection and writes through the selected connection.
