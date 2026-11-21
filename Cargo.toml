@@ -1,6 +1,6 @@
 [package]
 name = "buntrail-engine"
-version = "0.5.1"
+version = "0.5.2"
 edition = "2024"
 rust-version = "1.99.1"
 description = "Authoritative document and workspace orchestration."

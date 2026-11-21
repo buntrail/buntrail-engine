@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.2
+
+Retry Welcome once after an older verified helper has had time to retire. Preserve active and retained work and release unpublished Welcome leases on cancellation or home-read failure.
+
 ## 0.5.1
 
 Allow explicit quit discard to preserve an uncertain save reference without retrying the save.
