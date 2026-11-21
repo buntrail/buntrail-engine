@@ -70,13 +70,15 @@ fn container_welcome_refuses_missing_or_changed_actual_start_before_registration
                 container_start: expected_start,
             },
         };
-        let result = Transport::connect(client, &target, &lease);
+        let result = Transport::connect(client, &target, &lease, false);
         assert!(
             !peer.join().unwrap(),
             "wrong/missing actual start must never register an owner; expected start {:?}",
             lease.runtime.container_start
         );
-        assert_eq!(result.err().unwrap().code, ErrorCode::TargetChanged);
+        assert!(
+            matches!(result, Err(ConnectError::Other(error)) if error.code == ErrorCode::TargetChanged)
+        );
     }
 }
 
@@ -155,10 +157,167 @@ fn welcome_accepts_bounded_container_start_and_ordinary_ssh_without_start() {
                 container_start: start.clone(),
             },
         };
-        let transport = Transport::connect(client, &target, &lease).unwrap();
+        let transport = Transport::connect(client, &target, &lease, false).unwrap();
         assert_eq!(transport.scope.lease.runtime.supervisor_boot, [9; 16]);
         assert_eq!(transport.scope.lease.runtime.container_start, start);
         peer.join().unwrap();
+    }
+}
+
+#[test]
+fn welcome_requires_folder_capabilities_before_registering() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    for (welcome, home, folder, wrong_target, wrong_start, code) in [
+        (
+            true,
+            false,
+            false,
+            false,
+            false,
+            Some(ErrorCode::Unavailable),
+        ),
+        (
+            true,
+            true,
+            false,
+            false,
+            false,
+            Some(ErrorCode::Unavailable),
+        ),
+        (
+            true,
+            false,
+            true,
+            false,
+            false,
+            Some(ErrorCode::Unavailable),
+        ),
+        (true, true, true, false, false, None),
+        (false, false, false, false, false, None),
+        (
+            true,
+            false,
+            false,
+            true,
+            false,
+            Some(ErrorCode::TargetChanged),
+        ),
+        (
+            true,
+            false,
+            false,
+            false,
+            true,
+            Some(ErrorCode::TargetChanged),
+        ),
+    ] {
+        let container = true;
+        let register = code.is_none();
+        let target = TargetIdentity {
+            security_binding: b"host".to_vec(),
+            effective_user: b"1000".to_vec(),
+            filesystem_namespace: b"namespace".to_vec(),
+            container: container.then(|| ContainerIdentity {
+                engine_endpoint: b"endpoint".to_vec(),
+                immutable_id: vec![b'a'; 64],
+            }),
+        };
+        let start = container.then(|| vec![b's'; 256]);
+        let actual = if wrong_start {
+            Some(STANDARD.encode(b"other start"))
+        } else {
+            start.as_ref().map(|value| STANDARD.encode(value))
+        };
+        let binding = w::hex(&sha2::Sha256::digest(serde_json::to_vec(&target).unwrap()));
+        let (client, mut server) = UnixStream::pair().unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let peer = std::thread::spawn(move || {
+            let mut header = read_frame(&mut server, None).unwrap().header;
+            assert!(matches!(header.message, Message::Hello { .. }));
+            let mut capabilities = vec!["services".into(), "container.binding.v1".into()];
+            if home {
+                capabilities.push("welcome.home".into());
+            }
+            if folder {
+                capabilities.push("welcome.folder".into());
+            }
+            header.message = Message::Welcome {
+                capabilities,
+                max_header: 65536,
+                max_payload: 1048576,
+                initial_credit: 524288,
+                target_binding: if wrong_target {
+                    "aa".repeat(32)
+                } else {
+                    binding
+                },
+                runtime_generation: w::uuid([9; 16]),
+                container_start_base64: actual,
+            };
+            write_frame(
+                &mut server,
+                &Frame {
+                    header,
+                    payload: vec![],
+                },
+            )
+            .unwrap();
+            if !register {
+                assert_eq!(
+                    std::io::Read::read(&mut server, &mut [0]).unwrap(),
+                    0,
+                    "expected EOF before Register"
+                );
+                return;
+            }
+            let mut header = read_frame(&mut server, None).unwrap().header;
+            let Message::Register {
+                client_id,
+                workspace_id,
+                target_binding,
+                runtime_generation,
+                ..
+            } = &header.message
+            else {
+                panic!("expected owner registration")
+            };
+            header.context = Some(Context {
+                client_id: client_id.clone(),
+                workspace_id: workspace_id.clone(),
+                target_binding: target_binding.clone(),
+                runtime_generation: runtime_generation.clone(),
+            });
+            header.message = Message::Ack {};
+            write_frame(
+                &mut server,
+                &Frame {
+                    header,
+                    payload: vec![],
+                },
+            )
+            .unwrap();
+        });
+        let lease = WorkspaceLease {
+            client: ClientID([1; 16]),
+            workspace: WorkspaceID([2; 16]),
+            lease: WorkspaceLeaseID([3; 16]),
+            runtime: RuntimeGeneration {
+                supervisor_boot: [0; 16],
+                container_start: start.clone(),
+            },
+        };
+        let result = Transport::connect(client, &target, &lease, welcome);
+        peer.join().unwrap();
+        match result {
+            Ok(_) => assert_eq!(code, None),
+            Err(ConnectError::OlderHelper) => assert_eq!(code, Some(ErrorCode::Unavailable)),
+            Err(ConnectError::Other(error)) => assert_eq!(
+                Some(error.code),
+                code.filter(|c| *c != ErrorCode::Unavailable)
+            ),
+        }
     }
 }
 

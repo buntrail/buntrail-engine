@@ -34,6 +34,13 @@ impl Fixture {
         Self::using_transport(existing, false)
     }
     fn using_transport(existing: Option<Arc<LocalConnection>>, live_ssh: bool) -> Self {
+        Self::using_endpoint(existing, live_ssh, |endpoint| endpoint)
+    }
+    fn using_endpoint(
+        existing: Option<Arc<LocalConnection>>,
+        live_ssh: bool,
+        wrap: impl FnOnce(std::os::unix::net::UnixStream) -> std::os::unix::net::UnixStream,
+    ) -> Self {
         // Real Darwin Unix helper/protocol; this substitutes only physical SSH retirement.
         let server = support::Server::start();
         let local = existing.unwrap_or_else(|| {
@@ -87,7 +94,7 @@ impl Fixture {
             .map(|c| c.stream().unwrap())
             .unwrap_or_else(|| server.connect());
         let mut remote = RemoteServices::connect(
-            endpoint,
+            wrap(endpoint),
             local.identity.clone(),
             WorkspaceLease {
                 client: local.client,
@@ -125,6 +132,7 @@ impl Fixture {
         remote.physical().unwrap().ready();
         let anchor = Arc::new(remote);
         let attempt = Arc::new(Attempt {
+            welcome: false,
             parent_target: None,
             id: 41,
             prompt: Mutex::new(None),
@@ -197,6 +205,88 @@ fn cancelled_completed_waiter_does_not_publish_ready_or_close_sibling() {
     run(env.owner.close(ConnectionCloseReason::ResolvedFinalClose)).unwrap();
     until(|| fixture.retirement_started.load(Ordering::SeqCst));
 }
+#[test]
+fn cancelled_welcome_home_releases_its_view_and_preserves_a_sibling() {
+    use buntrail_protocol::{
+        services::Call,
+        types::{Header, Message},
+    };
+    use std::{
+        io::{Read, Write},
+        os::unix::net::UnixStream,
+        sync::mpsc,
+    };
+
+    let (blocked, is_blocked) = mpsc::channel();
+    let (resume, allow) = mpsc::channel();
+    let fixture = Fixture::using_endpoint(None, false, |mut helper| {
+        let (application, mut proxy) = UnixStream::pair().unwrap();
+        let (mut from_helper, mut to_application) =
+            (helper.try_clone().unwrap(), proxy.try_clone().unwrap());
+        std::thread::spawn(move || {
+            let _ = std::io::copy(&mut from_helper, &mut to_application);
+        });
+        std::thread::spawn(move || {
+            let mut owner = None;
+            let mut sizes = [0; 8];
+            while proxy.read_exact(&mut sizes).is_ok() {
+                let length = u32::from_be_bytes(sizes[..4].try_into().unwrap()) as usize;
+                let payload = u32::from_be_bytes(sizes[4..].try_into().unwrap()) as usize;
+                let mut frame = vec![0; length + payload];
+                proxy.read_exact(&mut frame).unwrap();
+                let header: Header = serde_json::from_slice(&frame[..length]).unwrap();
+                match header.message {
+                    Message::Register {
+                        workspace_id,
+                        lease_id,
+                        ..
+                    } => {
+                        owner = Some((workspace_id, lease_id));
+                    }
+                    Message::ServiceCall {
+                        call: Call::WelcomeHome {},
+                    } => {
+                        blocked.send(owner.take().unwrap()).unwrap();
+                        allow.recv_timeout(Duration::from_secs(5)).unwrap();
+                    }
+                    _ => {}
+                }
+                if helper
+                    .write_all(&sizes)
+                    .and_then(|_| helper.write_all(&frame))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            let _ = helper.shutdown(std::net::Shutdown::Both);
+        });
+        application
+    });
+    let sibling = run(Box::pin(
+        fixture.connector.start(locator(), None, None).unwrap(),
+    ))
+    .unwrap();
+    let welcome = fixture
+        .connector
+        .start_welcome(locator(), None, None)
+        .unwrap();
+    let (workspace, lease) = is_blocked.recv_timeout(Duration::from_secs(5)).unwrap();
+    let mut owner = sibling.services.lease().clone();
+    owner.workspace = WorkspaceID(buntrail_protocol::services::id(&workspace).unwrap());
+    owner.lease = WorkspaceLeaseID(buntrail_protocol::services::id(&lease).unwrap());
+    assert_ne!(sibling.services.lease(), &owner);
+    assert_ne!(welcome.state(), ConnectionState::Ready);
+    welcome.cancel();
+    resume.send(()).unwrap();
+    assert!(matches!(run(Box::pin(welcome)), Err(error) if error.code == ErrorCode::Cancelled));
+    assert_eq!(
+        sibling.services.observe_owner(owner).unwrap().presence,
+        LeasePresence::Absent
+    );
+    sibling.services.validate_environment_ready().unwrap();
+}
+
 #[test]
 fn last_view_close_waits_for_physical_retirement_and_preserves_siblings() {
     let mut fixture = Fixture::new();
@@ -297,6 +387,7 @@ fn distinct_profile_cannot_replace_live_or_inflight_target_auth_policy() {
     let mut other = locator();
     other.ssh_profile = Some("another-saved-policy".into());
     let candidate = Arc::new(Attempt {
+        welcome: false,
         parent_target: None,
         id: 99,
         prompt: Mutex::new(None),
@@ -381,4 +472,49 @@ fn connector_admission_is_shared_across_profiles_and_returns_after_cancellation(
         ),
         "another profile bypassed the shared live-dependent bound"
     );
+}
+
+#[test]
+fn welcome_upgrade_retries_once_and_respects_cancellation() {
+    for (cancel_during_wait, second_miss) in [(false, false), (true, false), (false, true)] {
+        let cancel = AtomicBool::new(false);
+        let mut opens = 0;
+        let mut waits = 0;
+        let grace = Duration::from_millis(if cancel_during_wait { 250 } else { 5 });
+        let start = Instant::now();
+        let result = std::thread::scope(|scope| {
+            with_helper_upgrade(
+                &cancel,
+                grace,
+                || {
+                    waits += 1;
+                    if cancel_during_wait {
+                        scope.spawn(|| {
+                            std::thread::sleep(Duration::from_millis(5));
+                            cancel.store(true, Ordering::SeqCst);
+                        });
+                    }
+                },
+                || {
+                    opens += 1;
+                    if opens == 1 || second_miss {
+                        Err(ConnectError::OlderHelper)
+                    } else {
+                        assert!(start.elapsed() >= grace);
+                        Ok(())
+                    }
+                },
+            )
+        });
+        assert_eq!(waits, 1);
+        assert_eq!(opens, if cancel_during_wait { 1 } else { 2 });
+        match (cancel_during_wait, second_miss) {
+            (true, _) => assert_eq!(result.unwrap_err().code, ErrorCode::Cancelled),
+            (false, true) => assert_eq!(
+                result.unwrap_err().message,
+                "The target is still running an older Buntrail helper. Finish any open Buntrail work on the target, then reconnect."
+            ),
+            _ => result.unwrap(),
+        }
+    }
 }

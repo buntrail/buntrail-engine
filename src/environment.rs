@@ -1,7 +1,7 @@
 //! Remote composition belongs in Engine; transports and process ownership remain in Services.
 mod container_picker;
 use crate::{
-    remote::{Lifetime, RemoteServices},
+    remote::{ConnectError, Lifetime, RemoteServices, supports_welcome},
     worker::run,
 };
 use buntrail_core::contracts::{
@@ -36,7 +36,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     task::{Context, Poll, Waker},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 const MAX_CONNECTIONS: usize = 100;
@@ -409,6 +409,7 @@ struct PromptClaim {
     waiter: Option<u64>,
 }
 struct Attempt {
+    welcome: bool,
     parent_target: Option<TargetIdentity>,
     id: u64,
     prompt: Mutex<Option<PromptClaim>>,
@@ -474,7 +475,7 @@ pub struct ConnectionPrompt {
     pub request: AuthenticationRequest,
 }
 pub struct ConnectRequest {
-    pub(crate) welcome: bool,
+    welcome: bool,
     permit: Arc<ConnectionPermit>,
     transition: Option<Arc<ConnectionPermit>>,
     resume_admission: Option<Arc<ResumeAdmission>>,
@@ -482,7 +483,7 @@ pub struct ConnectRequest {
     waiter: u64,
     attempt: Arc<Attempt>,
     cancel: Arc<AtomicBool>,
-    registration: Option<Arc<Mutex<Completion<Arc<RemoteServices>>>>>,
+    registration: Option<Arc<Mutex<Completion<RegisteredView>>>>,
     locator: EnvironmentLocator,
     local_state: Arc<Mutex<State>>,
     resume: Option<WorkspaceLease>,
@@ -490,10 +491,16 @@ pub struct ConnectRequest {
     workers: Arc<AtomicUsize>,
     finished: bool,
 }
+struct RegisteredView {
+    services: Arc<RemoteServices>,
+    home: Option<TargetPath>,
+}
+
 #[derive(Clone)]
 pub struct RemoteEnvironment {
     pub locator: EnvironmentLocator,
     pub services: Arc<RemoteServices>,
+    pub(crate) home: Option<TargetPath>,
     _workers: Arc<AtomicUsize>,
     _owner_admission: Option<Arc<ResumeAdmission>>,
 }
@@ -503,6 +510,7 @@ impl RemoteEnvironment {
         Self {
             locator,
             services,
+            home: None,
             _workers: Arc::new(AtomicUsize::new(0)),
             _owner_admission: None,
         }
@@ -597,23 +605,18 @@ impl EnvironmentConnector {
         expected: Option<TargetIdentity>,
         resume: Option<WorkspaceLease>,
     ) -> Result<ConnectRequest, CoreError> {
-        self.start_admitted(locator, expected, resume, None, false, None, None, None)
+        self.start_admitted(
+            locator, expected, resume, None, false, None, None, None, false,
+        )
     }
-    pub(crate) fn start_nested(
+    pub(crate) fn start_welcome(
         &self,
         locator: EnvironmentLocator,
         expected: Option<TargetIdentity>,
-        parent: TargetIdentity,
+        parent: Option<TargetIdentity>,
     ) -> Result<ConnectRequest, CoreError> {
         self.start_admitted(
-            locator,
-            expected,
-            None,
-            None,
-            false,
-            None,
-            None,
-            Some(parent),
+            locator, expected, None, None, false, None, None, parent, true,
         )
     }
     pub fn start_saved(
@@ -629,6 +632,7 @@ impl EnvironmentConnector {
             Some((record.id, record.lease)),
             None,
             None,
+            false,
         )
     }
     pub fn start_observer(
@@ -636,7 +640,17 @@ impl EnvironmentConnector {
         locator: EnvironmentLocator,
         expected: TargetIdentity,
     ) -> Result<ConnectRequest, CoreError> {
-        self.start_admitted(locator, Some(expected), None, None, true, None, None, None)
+        self.start_admitted(
+            locator,
+            Some(expected),
+            None,
+            None,
+            true,
+            None,
+            None,
+            None,
+            false,
+        )
     }
     // Independent saved/resume/registration/container identities must remain explicit at admission.
     #[allow(clippy::too_many_arguments)]
@@ -650,6 +664,7 @@ impl EnvironmentConnector {
         saved: Option<(WorkspaceID, WorkspaceLeaseID)>,
         selected_container: Option<SelectedContainer>,
         parent_target: Option<TargetIdentity>,
+        welcome: bool,
     ) -> Result<ConnectRequest, CoreError> {
         let (permit, transition) = if let Some(existing) = existing {
             if !Arc::ptr_eq(&existing.budget, &self.budget) {
@@ -744,11 +759,15 @@ impl EnvironmentConnector {
         let index = pool.entries.iter().position(|e| e.locator == locator);
         let existing = index
             .and_then(|i| pool.entries[i].attempt.upgrade())
-            .filter(|a| !a.cancel.load(Ordering::SeqCst));
+            .filter(|a| {
+                !a.cancel.load(Ordering::SeqCst)
+                    && !matches!(a.result.lock().unwrap().value, Some(Err(_)))
+            });
         let attempt = if let Some(attempt) = existing {
             if attempt.parent_target != parent_target
                 || attempt.expected != expected
                 || attempt.selected_container != selected_container
+                || (attempt.welcome != welcome && attempt.result.lock().unwrap().value.is_none())
             {
                 return Err(CoreError::new(
                     ErrorCode::Busy,
@@ -764,6 +783,7 @@ impl EnvironmentConnector {
                 ));
             }
             let attempt = Arc::new(Attempt {
+                welcome,
                 parent_target: parent_target.clone(),
                 id: NEXT.fetch_add(1, Ordering::SeqCst),
                 prompt: Mutex::new(None),
@@ -776,15 +796,17 @@ impl EnvironmentConnector {
                 dependents: AtomicUsize::new(0),
                 reservation_released: AtomicBool::new(false),
             });
-            let reusable = index
-                .and_then(|i| pool.entries[i].route.upgrade())
+            let prior = index.and_then(|i| pool.entries[i].route.upgrade());
+            let reusable = prior
+                .as_ref()
                 .filter(|r| {
                     r.connection_state() == ConnectionState::Ready && parent_target.is_none()
-                });
+                })
+                .cloned();
             let entry = PoolEntry {
                 locator: locator.clone(),
                 attempt: Arc::downgrade(&attempt),
-                route: reusable.as_ref().map(Arc::downgrade).unwrap_or_default(),
+                route: prior.as_ref().map(Arc::downgrade).unwrap_or_default(),
             };
             if let Some(i) = index {
                 pool.entries[i] = entry;
@@ -852,7 +874,7 @@ impl EnvironmentConnector {
         }
         drop(pool);
         let mut request = ConnectRequest {
-            welcome: false,
+            welcome,
             permit,
             transition,
             resume_admission,
@@ -1012,6 +1034,7 @@ impl ConnectRequest {
         let transition = self.transition.clone();
         let resume_admission = self.resume_admission.clone();
         let attempt = self.attempt.clone();
+        let welcome = self.welcome;
         let cancel = self.cancel.clone();
         let resume = self.resume.clone();
         let saved = self.saved;
@@ -1059,6 +1082,9 @@ impl ConnectRequest {
                     ));
                 }
                 anchor.validate_connection_ready()?;
+                if welcome && !supports_welcome(anchor.negotiated_capabilities()) {
+                    return Err(older_helper());
+                }
                 let lease = if let Some(owner) = resume {
                     let observer = anchor.anchored_workspace(WorkspaceLease {
                         client: anchor.lease().client,
@@ -1097,6 +1123,17 @@ impl ConnectRequest {
                 let mut view = anchor.anchored_workspace(lease)?;
                 view.bind_connection_permit(permit);
                 let view = Arc::new(view);
+                let home = if welcome {
+                    match view.with_cancellation(cancel.clone()).welcome_home() {
+                        Ok(home) => Some(home),
+                        Err(error) => {
+                            let _ = view.release_workspace(release_intent);
+                            return Err(error);
+                        }
+                    }
+                } else {
+                    None
+                };
                 let mut output = completion.lock().unwrap();
                 if cancel.load(Ordering::SeqCst) || attempt.cancel.load(Ordering::SeqCst) {
                     drop(output);
@@ -1104,7 +1141,10 @@ impl ConnectRequest {
                     return Err(cancelled());
                 }
                 State::publish(&status, ConnectionState::Ready);
-                output.complete(Ok(view));
+                output.complete(Ok(RegisteredView {
+                    services: view,
+                    home,
+                }));
                 Ok(())
             })();
             if let Err(error) = result {
@@ -1134,7 +1174,7 @@ impl Future for ConnectRequest {
             if self.cancel.load(Ordering::SeqCst)
                 && let Ok(view) = &result
             {
-                let view = view.clone();
+                let view = view.services.clone();
                 let completion = registration.clone();
                 let intent = if self.resume.is_some() || self.saved.is_some() {
                     LeaseReleaseIntent::ViewDetachment
@@ -1167,9 +1207,10 @@ impl Future for ConnectRequest {
                 self.resume_admission.take();
                 None
             };
-            Poll::Ready(result.map(|services| RemoteEnvironment {
+            Poll::Ready(result.map(|view| RemoteEnvironment {
                 locator: self.locator.clone(),
-                services,
+                services: view.services,
+                home: view.home,
                 _workers: self.workers.clone(),
                 _owner_admission: owner_admission,
             }))
@@ -1191,7 +1232,7 @@ impl Drop for ConnectRequest {
                 LeaseReleaseIntent::ResolvedWorkspaceClosure
             };
             let _ = spawn(&self.workers, move || {
-                let _ = view.release_workspace(intent);
+                let _ = view.services.release_workspace(intent);
             });
         }
     }
@@ -1256,6 +1297,49 @@ fn claim_target(
     });
     Ok(())
 }
+fn older_helper() -> CoreError {
+    unavailable(
+        "The target is still running an older Buntrail helper. Finish any open Buntrail work on the target, then reconnect.",
+    )
+}
+
+fn with_helper_upgrade<T>(
+    cancel: &AtomicBool,
+    grace: Duration,
+    preparing: impl FnOnce(),
+    mut open: impl FnMut() -> Result<T, ConnectError>,
+) -> Result<T, CoreError> {
+    let check_cancelled = || {
+        if cancel.load(Ordering::SeqCst) {
+            Err(cancelled())
+        } else {
+            Ok(())
+        }
+    };
+    check_cancelled()?;
+    match open() {
+        Ok(connection) => return Ok(connection),
+        Err(ConnectError::Other(error)) => return Err(error),
+        Err(ConnectError::OlderHelper) => {}
+    }
+    preparing();
+    // Keep the bridge closed while the older supervisor's 30-second idle timer runs.
+    let deadline = Instant::now() + grace;
+    loop {
+        check_cancelled()?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(50)));
+    }
+    check_cancelled()?;
+    open().map_err(|error| match error {
+        ConnectError::Other(error) => error,
+        ConnectError::OlderHelper => older_helper(),
+    })
+}
+
 fn connect_ssh(
     attempt: &Arc<Attempt>,
     configuration: SshConfiguration,
@@ -1339,7 +1423,25 @@ fn connect_ssh(
                 "verified SSH target changed before bootstrap",
             ));
         }
-        claim_target(&mut registry.lock().unwrap(), attempt, &target, locator)?;
+        {
+            let mut pool = registry.lock().unwrap();
+            // A nested route still re-verifies its parent and container before consulting a live owner.
+            if attempt.welcome
+                && attempt.parent_target.is_some()
+                && let Some(route) = pool
+                    .entries
+                    .iter()
+                    .find(|entry| &entry.locator == locator)
+                    .and_then(|entry| entry.route.upgrade())
+                && route.connection_state() == ConnectionState::Ready
+                && route.target() == &target
+                && route.runtime().container_start == container_start
+                && !supports_welcome(route.negotiated_capabilities())
+            {
+                return Err(older_helper());
+            }
+            claim_target(&mut pool, attempt, &target, locator)?;
+        }
         let package = configuration.selected_package(platform, &attempt.cancel)?;
         State::publish(&attempt.state, ConnectionState::PreparingHelper);
         let bootstrap = if let Some(container) = container {
@@ -1348,8 +1450,6 @@ fn connect_ssh(
             HelperBootstrapper::new(ssh.unwrap(), package)?
         };
         let descriptor = run(bootstrap.ensure_available(target.clone()))?;
-        let bridge = bootstrap.bridge(&descriptor)?;
-        State::publish(&attempt.state, ConnectionState::Negotiating);
         let lease = WorkspaceLease {
             client,
             workspace: WorkspaceID(new_id()?),
@@ -1359,11 +1459,28 @@ fn connect_ssh(
                 container_start,
             },
         };
-        let mut remote = RemoteServices::connect(
-            bridge.channel.stream()?,
-            target,
-            lease,
-            configuration.spool_directory,
+        let (mut remote, bridge) = with_helper_upgrade(
+            &attempt.cancel,
+            Duration::from_secs(35),
+            || State::publish(&attempt.state, ConnectionState::PreparingHelper),
+            || {
+                let bridge = bootstrap.bridge(&descriptor)?;
+                State::publish(&attempt.state, ConnectionState::Negotiating);
+                match RemoteServices::connect_for_intent(
+                    bridge.channel.stream()?,
+                    target.clone(),
+                    lease.clone(),
+                    configuration.spool_directory.clone(),
+                    attempt.welcome,
+                ) {
+                    Ok(remote) => Ok((remote, bridge)),
+                    Err(ConnectError::OlderHelper) => {
+                        run(Box::pin(bridge.channel.close()));
+                        Err(ConnectError::OlderHelper)
+                    }
+                    Err(error) => Err(error),
+                }
+            },
         )?;
         remote.bind_physical(bridge.channel)?;
         let owner = remote.physical().unwrap();

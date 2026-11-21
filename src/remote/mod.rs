@@ -38,8 +38,8 @@ pub struct RemoteServices {
     // A registered view keeps the reusable physical anchor alive, never the reverse.
     anchor: Option<Arc<RemoteServices>>,
 }
-pub(crate) use transport::Lifetime;
 pub use transport::Shutdown as RemoteShutdown;
+pub(crate) use transport::{ConnectError, Lifetime, supports_welcome};
 impl RemoteServices {
     /// The route owner supplies an authenticated byte transport and verified target, never a display hostname.
     pub fn connect(
@@ -48,8 +48,25 @@ impl RemoteServices {
         lease: WorkspaceLease,
         spool_directory: std::path::PathBuf,
     ) -> Result<Self, CoreError> {
+        Self::connect_for_intent(socket, target, lease, spool_directory, false).map_err(|error| {
+            match error {
+                ConnectError::Other(error) => error,
+                ConnectError::OlderHelper => {
+                    unreachable!("ordinary connections do not require Welcome capabilities")
+                }
+            }
+        })
+    }
+
+    pub(crate) fn connect_for_intent(
+        socket: std::os::unix::net::UnixStream,
+        target: TargetIdentity,
+        lease: WorkspaceLease,
+        spool_directory: std::path::PathBuf,
+        welcome: bool,
+    ) -> Result<Self, ConnectError> {
         let spools = buntrail_services::leases::LeasePool::open(spool_directory)?;
-        let transport = transport::Transport::connect(socket, &target, &lease)?;
+        let transport = transport::Transport::connect(socket, &target, &lease, welcome)?;
         let lease = WorkspaceLease {
             runtime: transport.runtime.clone(),
             ..lease

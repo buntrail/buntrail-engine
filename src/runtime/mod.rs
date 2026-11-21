@@ -364,7 +364,7 @@ impl Runtime {
         if registry.attempts.len() + registry.remotes.len() >= 32 {
             return Err(fail("busy", "Remote environment capacity reached"));
         }
-        let mut connect = if let Some(record) = saved {
+        let connect = if let Some(record) = saved {
             if let Some(owner) = resume {
                 context.connector.start(
                     record.locator.environment,
@@ -374,15 +374,12 @@ impl Runtime {
             } else {
                 context.connector.start_saved(&record)
             }
+        } else if request["intent"] == "welcome" {
+            context.connector.start_welcome(locator, expected, parent)
         } else {
-            if let Some(parent) = parent {
-                context.connector.start_nested(locator, expected, parent)
-            } else {
-                context.connector.start(locator, expected, resume)
-            }
+            context.connector.start(locator, expected, resume)
         }
         .map_err(error)?;
-        connect.welcome = request["intent"] == "welcome";
         let id = registry.id("connection")?;
         registry
             .attempts
@@ -425,28 +422,21 @@ impl Runtime {
                 json!({"done":false,"state":state,"prompt":{"attempt":prompt.attempt,"id":prompt.request.id,"kind":prompt.request.kind,"text":prompt.request.prompt}}),
             );
         }
+        let mut registry = self
+            .registry
+            .lock()
+            .map_err(|_| fail("engine_failed", "Remote registry poisoned"))?;
+        if !registry.attempts.contains_key(id) {
+            return Err(fail("cancelled", "Connection attempt cancelled"));
+        }
         match Pin::new(&mut *request).poll(&mut TaskContext::from_waker(Waker::noop())) {
             Poll::Pending => Ok(json!({"done":false,"state":state})),
             Poll::Ready(result) => {
-                self.registry
-                    .lock()
-                    .map_err(|_| fail("engine_failed", "Remote registry poisoned"))?
-                    .attempts
-                    .remove(id)
-                    .ok_or_else(|| fail("cancelled", "Connection attempt cancelled"))?;
+                registry.attempts.remove(id);
                 let environment = result.map_err(error)?;
-                let home = if request.welcome {
-                    Some(environment.services.welcome_home().map_err(error)?)
-                } else {
-                    None
-                };
-                let mut registry = self
-                    .registry
-                    .lock()
-                    .map_err(|_| fail("engine_failed", "Remote registry poisoned"))?;
                 let remote = registry.id("remote")?;
                 let mut value = json!({"done":true,"id":remote,"target":environment.services.target(),"runtime":environment.services.runtime(),"lease":environment.services.lease(),"locator":environment.locator});
-                if let Some(home) = home {
+                if let Some(home) = &environment.home {
                     value["home"] = json!(home);
                 }
                 registry.remotes.insert(

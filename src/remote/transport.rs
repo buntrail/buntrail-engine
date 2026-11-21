@@ -250,12 +250,31 @@ fn closed() -> CoreError {
         "Remote connection lost; inspect accepted operations, never replay",
     )
 }
+#[derive(Debug)]
+pub(crate) enum ConnectError {
+    Other(CoreError),
+    OlderHelper,
+}
+
+impl From<CoreError> for ConnectError {
+    fn from(error: CoreError) -> Self {
+        Self::Other(error)
+    }
+}
+
+pub(crate) fn supports_welcome(capabilities: &[String]) -> bool {
+    ["welcome.home", "welcome.folder"]
+        .iter()
+        .all(|required| capabilities.iter().any(|capability| capability == required))
+}
+
 impl Transport {
     pub fn connect(
         mut socket: UnixStream,
         target: &TargetIdentity,
         lease: &WorkspaceLease,
-    ) -> Result<Self, CoreError> {
+        welcome_required: bool,
+    ) -> Result<Self, ConnectError> {
         socket
             .set_read_timeout(Some(Duration::from_secs(5)))
             .map_err(io_error)?;
@@ -288,7 +307,7 @@ impl Transport {
         )?;
         let welcome = read_frame(&mut socket, None)?;
         if welcome.header.request_id != 1 {
-            return Err(w::invalid());
+            return Err(w::invalid().into());
         }
         let Message::Welcome {
             target_binding,
@@ -298,22 +317,22 @@ impl Transport {
             ..
         } = welcome.header.message
         else {
-            return Err(w::invalid());
+            return Err(w::invalid().into());
         };
         if !capabilities.iter().any(|s| s == "services") {
             return Err(CoreError::new(
                 ErrorCode::Unavailable,
                 "Remote service capability unavailable",
-            ));
+            )
+            .into());
         }
         let expected = w::hex(&sha2::Sha256::digest(
             serde_json::to_vec(target).map_err(io_error)?,
         ));
         if target_binding != expected {
-            return Err(CoreError::new(
-                ErrorCode::TargetChanged,
-                "Helper target binding changed",
-            ));
+            return Err(
+                CoreError::new(ErrorCode::TargetChanged, "Helper target binding changed").into(),
+            );
         }
         let runtime = RuntimeGeneration {
             supervisor_boot: w::id(&runtime_generation)?,
@@ -326,19 +345,19 @@ impl Transport {
             return Err(CoreError::new(
                 ErrorCode::TargetChanged,
                 "Container helper Welcome is missing verified start evidence; no owner was registered",
-            ));
+            ).into());
         }
         if runtime.container_start != lease.runtime.container_start {
             return Err(CoreError::new(
                 ErrorCode::TargetChanged,
                 "Helper container start generation changed; preserve the original runtime and reconcile explicitly",
-            ));
+            ).into());
         }
         if lease.runtime.supervisor_boot != [0; 16] && lease.runtime != runtime {
-            return Err(CoreError::new(
-                ErrorCode::TargetChanged,
-                "Helper runtime changed",
-            ));
+            return Err(CoreError::new(ErrorCode::TargetChanged, "Helper runtime changed").into());
+        }
+        if welcome_required && !supports_welcome(&capabilities) {
+            return Err(ConnectError::OlderHelper);
         }
         let context = Context {
             workspace_id: w::uuid(lease.workspace.0),
@@ -363,7 +382,7 @@ impl Transport {
         )?;
         let ack = read_frame(&mut socket, Some(&context))?;
         if ack.header.request_id != 2 || !matches!(ack.header.message, Message::Ack {}) {
-            return Err(w::invalid());
+            return Err(w::invalid().into());
         }
         socket.set_nonblocking(true).map_err(io_error)?;
         let (tx, rx) = mpsc::sync_channel::<SendFrame>(32);
